@@ -1,14 +1,14 @@
+import os
+from dotenv import load_dotenv
 import random
 import re
 import telebot
 from telebot import types
 from collections import defaultdict
-import os
-import dotenv
-
 
 load_dotenv()
-bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))
+TOKEN = os.getenv('BOT_TOKEN')
+bot = telebot.TeleBot(TOKEN)
 user_data = {}
 questions_by_topic = {}
 topics_list = []
