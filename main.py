@@ -3,9 +3,11 @@ import re
 import telebot
 from telebot import types
 from collections import defaultdict
+import os
+from dotenv import load_dotenv
 
-TOKEN = 'BOT_TOKEN'
-bot = telebot.TeleBot(TOKEN)
+load_dotenv()
+bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))
 user_data = {}
 questions_by_topic = {}
 topics_list = []
