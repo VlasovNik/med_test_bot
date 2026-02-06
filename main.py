@@ -4,7 +4,8 @@ import telebot
 from telebot import types
 from collections import defaultdict
 import os
-from dotenv import load_dotenv
+import dotenv
+
 
 load_dotenv()
 bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))
