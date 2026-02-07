@@ -1,1 +1,2 @@
 python-dotenv>=1.0.0
+pytelegrambotapi==4.18.0
