@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 import random
+import time
 import re
 import telebot
 from telebot import types
@@ -12,12 +13,31 @@ bot = telebot.TeleBot(TOKEN)
 user_data = {}
 questions_by_topic = {}
 topics_list = []
+questions_loaded = False
+
+def wait_for_questions_file(filename, check_interval=15):
+    """
+    Ожидает появления файла с вопросами
+    """
+    print(f"⏳ Ожидание файла '{filename}'...")
+    
+    while not os.path.exists(filename):
+        print(f"Файл '{filename}' не найден. Повторная проверка через {check_interval} секунд...")
+        time.sleep(check_interval)
+    
+    print(f"✅ Файл '{filename}' найден!")
+    return True
 
 def load_and_parse_questions(filename):
     """
     Загружает вопросы из файла и группирует их по темам
     """
     try:
+        # Проверяем существование файла
+        if not os.path.exists(filename):
+            print(f"❌ Файл '{filename}' не найден!")
+            return False
+
         with open(filename, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
@@ -123,7 +143,7 @@ def load_and_parse_questions(filename):
             })
 
         # Отладочная информация
-        print(f"Загружено {len(topics_list)} тем:")
+        print(f"✅ Загружено {len(topics_list)} тем:")
         for topic in topics_list:
             print(f"  - {topic}: {len(questions_by_topic[topic])} вопросов")
 
@@ -133,7 +153,7 @@ def load_and_parse_questions(filename):
         return True
 
     except Exception as e:
-        print(f"Ошибка при загрузке вопросов: {e}")
+        print(f"❌ Ошибка при загрузке вопросов: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -149,7 +169,7 @@ def get_random_question_from_topic(topic_name):
             all_questions.extend(questions_by_topic[topic])
 
         if not all_questions:
-            print("Нет вопросов для выбора!")
+            print("❌ Нет вопросов для выбора!")
             return None
 
         return random.choice(all_questions)
@@ -158,19 +178,39 @@ def get_random_question_from_topic(topic_name):
         if questions:
             return random.choice(questions)
         else:
-            print(f"В теме '{topic_name}' нет вопросов!")
+            print(f"❌ В теме '{topic_name}' нет вопросов!")
 
-    print(f"Тема '{topic_name}' не найдена!")
+    print(f"❌ Тема '{topic_name}' не найдена!")
     return None
 
-# Загружаем вопросы при запуске
-print("Загружаю вопросы...")
-questions_loaded = load_and_parse_questions('тест.txt')
-print(f"Загрузка завершена: {questions_loaded}")
+def check_and_load_questions():
+    """
+    Проверяет и загружает вопросы из файла
+    """
+    global questions_loaded
+    
+    if os.path.exists('тест.txt'):
+        print("📂 Файл 'тест.txt' найден. Загружаю вопросы...")
+        questions_loaded = load_and_parse_questions('тест.txt')
+        print(f"📊 Загрузка завершена: {'✅ Успешно' if questions_loaded else '❌ Ошибка'}")
+        return questions_loaded
+    else:
+        print("❌ Файл 'тест.txt' не найден!")
+        return False
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     chat_id = message.chat.id
+
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.send_message(
+            chat_id,
+            "⏳ Вопросы еще не загружены. Пожалуйста, подождите...\n\n"
+            "Если файл с вопросами отсутствует, создайте файл 'тест.txt' в папке с ботом."
+        )
+        return
 
     # Инициализируем данные пользователя с статистикой
     user_data[chat_id] = {
@@ -188,23 +228,21 @@ def send_welcome(message):
     }
 
     # Проверяем загружены ли вопросы
-    if not questions_loaded or not topics_list:
+    if not topics_list:
         bot.send_message(chat_id, "❌ Не удалось загрузить вопросы. Проверьте файл с вопросами.")
-        print("Ошибка: вопросы не загружены!")
-        print(f"questions_loaded: {questions_loaded}")
-        print(f"topics_list: {topics_list}")
+        print("❌ Ошибка: вопросы не загружены!")
         return
 
     # Формируем текст со списком тем
     topics_text = "📚 ДОСТУПНЫЕ ТЕМЫ:\n\n"
     for i, topic in enumerate(topics_list, 1):
         topics_text += f"{i}. {topic}\n"
-
+    
     topics_text += "\nВыберите номер темы:"
 
     # Создаем inline клавиатуру только с номерами тем
     markup = types.InlineKeyboardMarkup(row_width=5)
-
+    
     # Создаем кнопки с номерами тем
     buttons = []
     for i in range(1, len(topics_list) + 1):
@@ -212,7 +250,7 @@ def send_welcome(message):
             text=str(i),
             callback_data=f"topic_{i-1}"
         ))
-
+    
     # Добавляем кнопки в несколько строк по 5 в каждой
     for i in range(0, len(buttons), 5):
         markup.row(*buttons[i:i+5])
@@ -230,7 +268,7 @@ def send_welcome(message):
 
     # Отправляем сначала приветственное сообщение
     bot.send_message(chat_id, welcome_text)
-
+    
     # Затем отправляем отдельное сообщение со списком тем и кнопками
     bot.send_message(chat_id, topics_text, reply_markup=markup)
 
@@ -240,6 +278,12 @@ def select_topic_callback(call):
     message_id = call.message.message_id
 
     try:
+        # Проверяем загружены ли вопросы
+        global questions_loaded
+        if not questions_loaded:
+            bot.answer_callback_query(call.id, "❌ Вопросы еще не загружены!")
+            return
+
         # Извлекаем номер темы из callback_data
         topic_num = int(call.data.split('_')[1])
 
@@ -310,13 +354,13 @@ def select_topic_callback(call):
 
     except (ValueError, IndexError) as e:
         bot.answer_callback_query(call.id, "❌ Ошибка при выборе темы.")
-        print(f"Ошибка выбора темы: {e}")
+        print(f"❌ Ошибка выбора темы: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
 def cancel_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
-
+    
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
@@ -332,6 +376,16 @@ def get_question_callback(call):
     send_question_inline(chat_id, message_id)
 
 def send_question_inline(chat_id, message_id):
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="❌ Вопросы еще не загружены. Пожалуйста, подождите...",
+        )
+        return
+
     if chat_id not in user_data or not user_data[chat_id]['current_topic']:
         bot.edit_message_text(
             chat_id=chat_id,
@@ -379,7 +433,7 @@ def send_question_inline(chat_id, message_id):
         user_data[chat_id]['numbered_answers'][i] = answer['text']
         user_data[chat_id]['answers_list'].append(answer_text)
 
-    # Создаем текст вопроса с вариантами ответов
+    # Создаем текст вопросов с вариантами ответов
     topic_display = topic
     question_text = f"📚 Тема: {topic_display}\n\n"
 
@@ -392,17 +446,17 @@ def send_question_inline(chat_id, message_id):
     # Форматируем текст вопроса
     q_text = question_data['question']
     question_text += f"❓ {q_text}\n\n"
-
+    
     # Добавляем варианты ответов в текст сообщения
     question_text += "📋 Варианты ответов:\n"
     for answer_line in answers_texts:
         question_text += f"{answer_line}\n"
-
+    
     question_text += "\nВыберите номер правильного ответа:"
 
     # Создаем inline клавиатуру только с номерами ответов
     markup = types.InlineKeyboardMarkup(row_width=4)
-
+    
     # Создаем кнопки с номерами ответов
     buttons = []
     for i in range(1, len(answers) + 1):
@@ -410,7 +464,7 @@ def send_question_inline(chat_id, message_id):
             text=str(i),
             callback_data=f"answer_{i}"
         ))
-
+    
     # Добавляем кнопки в несколько строк по 4 в каждой
     for i in range(0, len(buttons), 4):
         markup.row(*buttons[i:i+4])
@@ -436,6 +490,12 @@ def send_question_inline(chat_id, message_id):
 def check_answer_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
+
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.answer_callback_query(call.id, "❌ Вопросы еще не загружены!")
+        return
 
     if chat_id not in user_data:
         bot.answer_callback_query(call.id, "⚠️ Сначала выберите тему!")
@@ -522,12 +582,18 @@ def check_answer_callback(call):
 
     except (ValueError, IndexError) as e:
         bot.answer_callback_query(call.id, "❌ Ошибка при обработке ответа.")
-        print(f"Ошибка обработки ответа: {e}")
+        print(f"❌ Ошибка обработки ответа: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_stats")
 def show_stats_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
+
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.answer_callback_query(call.id, "❌ Вопросы еще не загружены!")
+        return
 
     if chat_id not in user_data or 'stats' not in user_data[chat_id]:
         stats_text = "📊 Статистика еще не собрана. Начните отвечать на вопросы!"
@@ -584,16 +650,22 @@ def change_topic_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.answer_callback_query(call.id, "❌ Вопросы еще не загружены!")
+        return
+
     # Формируем текст со списком тем
     topics_text = "📚 ДОСТУПНЫЕ ТЕМЫ:\n\n"
     for i, topic in enumerate(topics_list, 1):
         topics_text += f"{i}. {topic}\n"
-
+    
     topics_text += "\nВыберите номер темы:"
 
     # Создаем inline клавиатуру только с номерами тем
     markup = types.InlineKeyboardMarkup(row_width=5)
-
+    
     # Создаем кнопки с номерами тем
     buttons = []
     for i in range(1, len(topics_list) + 1):
@@ -601,7 +673,7 @@ def change_topic_callback(call):
             text=str(i),
             callback_data=f"topic_{i-1}"
         ))
-
+    
     # Добавляем кнопки в несколько строк по 5 в каждой
     for i in range(0, len(buttons), 5):
         markup.row(*buttons[i:i+5])
@@ -622,7 +694,7 @@ def change_topic_callback(call):
 def back_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
-
+    
     if chat_id not in user_data or not user_data[chat_id]['current_topic']:
         bot.edit_message_text(
             chat_id=chat_id,
@@ -630,7 +702,7 @@ def back_callback(call):
             text="⚠️ Сначала выберите тему! Нажмите /start",
         )
         return
-
+    
     topic = user_data[chat_id]['current_topic']
     topic_info = f"""
 ✅ Текущая тема: {topic}
@@ -658,7 +730,7 @@ def back_callback(call):
         text=topic_info,
         reply_markup=markup
     )
-
+    
     bot.answer_callback_query(call.id, "Возврат")
 
 @bot.callback_query_handler(func=lambda call: call.data == "end_session")
@@ -709,6 +781,12 @@ def new_session_callback(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.answer_callback_query(call.id, "❌ Вопросы еще не загружены!")
+        return
+
     # Инициализируем новую сессию
     user_data[chat_id] = {
         'current_topic': None,
@@ -728,12 +806,12 @@ def new_session_callback(call):
     topics_text = "📚 ДОСТУПНЫЕ ТЕМЫ:\n\n"
     for i, topic in enumerate(topics_list, 1):
         topics_text += f"{i}. {topic}\n"
-
+    
     topics_text += "\nВыберите номер темы:"
 
     # Создаем inline клавиатуру только с номерами тем
     markup = types.InlineKeyboardMarkup(row_width=5)
-
+    
     # Создаем кнопки с номерами тем
     buttons = []
     for i in range(1, len(topics_list) + 1):
@@ -741,7 +819,7 @@ def new_session_callback(call):
             text=str(i),
             callback_data=f"topic_{i-1}"
         ))
-
+    
     # Добавляем кнопки в несколько строк по 5 в каждой
     for i in range(0, len(buttons), 5):
         markup.row(*buttons[i:i+5])
@@ -770,6 +848,12 @@ def new_session_callback(call):
 @bot.message_handler(func=lambda message: message.text == "/stats" or message.text == "📊 Статистика")
 def show_stats_message(message):
     chat_id = message.chat.id
+
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.send_message(chat_id, "❌ Вопросы еще не загружены!")
+        return
 
     if chat_id not in user_data or 'stats' not in user_data[chat_id]:
         bot.send_message(chat_id, "📊 Статистика еще не собрана. Начните отвечать на вопросы!")
@@ -815,20 +899,70 @@ def stop_command(message):
     chat_id = message.chat.id
     end_session_callback(type('Callback', (), {'message': type('Message', (), {'chat': type('Chat', (), {'id': chat_id}), 'message_id': None})()})())
 
+@bot.message_handler(commands=['reload'])
+def reload_questions_command(message):
+    """
+    Команда для ручной перезагрузки вопросов
+    """
+    chat_id = message.chat.id
+    
+    bot.send_message(chat_id, "🔄 Перезагружаю вопросы из файла...")
+    
+    global questions_loaded
+    questions_loaded = check_and_load_questions()
+    
+    if questions_loaded:
+        bot.send_message(chat_id, f"✅ Вопросы успешно перезагружены!\nЗагружено тем: {len(topics_list)-1}")
+    else:
+        bot.send_message(chat_id, "❌ Не удалось загрузить вопросы. Проверьте файл 'тест.txt'")
+
+@bot.message_handler(func=lambda message: True)
+def handle_other_messages(message):
+    """
+    Обработчик для всех остальных сообщений
+    """
+    chat_id = message.chat.id
+    
+    # Проверяем загружены ли вопросы
+    global questions_loaded
+    if not questions_loaded:
+        bot.send_message(
+            chat_id,
+            "⏳ Вопросы еще не загружены. Бот ожидает файл 'тест.txt'...\n\n"
+            "Создайте файл 'тест.txt' в папке с ботом или используйте команду /reload для загрузки."
+        )
+        return
+    
+    # Если вопросы загружены, отправляем приглашение
+    bot.send_message(chat_id, "Для начала работы используйте команду /start")
+
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("Запуск бота...")
-    print(f"Темы загружены: {questions_loaded}")
-    print(f"Количество тем: {len(topics_list) if topics_list else 0}")
-
+    print("🚀 Запуск бота...")
+    print("="*50)
+    
+    # Пытаемся загрузить вопросы при запуске
+    if os.path.exists('тест.txt'):
+        print("📂 Файл 'тест.txt' найден. Загружаю вопросы...")
+        questions_loaded = check_and_load_questions()
+    else:
+        print("❌ Файл 'тест.txt' не найден!")
+        print("⏳ Запускаю бота в режиме ожидания файла...")
+        print("ℹ️ Бот будет работать, но вопросы будут недоступны до загрузки файла")
+        print("ℹ️ Создайте файл 'тест.txt' в папке с ботом и используйте команду /reload")
+    
+    print("\n" + "="*50)
+    print("🤖 Бот запущен. Ожидание сообщений...")
+    
     if questions_loaded and topics_list:
-        print("\nДоступные темы:")
+        print("\n✅ Доступные темы:")
         for i, topic in enumerate(topics_list, 1):
             print(f"{i}. {topic}")
         print("="*50)
-
-        print("Бот запущен. Ожидание сообщений...")
+    
+    # Запускаем бота
+    try:
         bot.polling(none_stop=True, interval=0)
-    else:
-        print("❌ Не удалось загрузить вопросы. Проверьте файл 'тест.txt'")
+    except Exception as e:
+        print(f"❌ Ошибка при запуске бота: {e}")
         print("="*50)
