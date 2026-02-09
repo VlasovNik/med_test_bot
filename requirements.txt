@@ -1,2 +1,5 @@
+pyTelegramBotAPI==4.23.0
 python-dotenv>=1.0.0
-pytelegrambotapi==4.18.0
+APScheduler==3.10.4
+pytz==2024.1
+requests==2.31.0
