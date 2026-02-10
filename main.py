@@ -19,6 +19,10 @@ import json
 from collections import defaultdict
 from typing import Optional, Dict, List, Any, Set
 import shutil
+import yookassa
+from yookassa import Payment, Configuration
+from yookassa.domain.notification import WebhookNotificationEventType, WebhookNotificationFactory
+import uuid
 
 # Загрузка переменных окружения
 from dotenv import load_dotenv
@@ -32,9 +36,27 @@ TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен в переменных окружения!")
 
+# Конфигурация ЮKassa - одна цена
+SUBSCRIPTION_PRICE = 250  # Одна цена: 250 рублей за месяц
+SUBSCRIPTION_DAYS = 300    # 30 дней подписка
+
+# Ключи ЮKassa
+YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID')
+YOOKASSA_SECRET_KEY = os.getenv('YOOKASSA_SECRET_KEY')
+
+# Настройка ЮKassa
+if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+    try:
+        Configuration.account_id = YOOKASSA_SHOP_ID
+        Configuration.secret_key = YOOKASSA_SECRET_KEY
+        print(f"✅ ЮKassa настроена. Цена подписки: {SUBSCRIPTION_PRICE}₽")
+    except Exception as e:
+        print(f"⚠️ Ошибка настройки ЮKassa: {e}")
+else:
+    print("⚠️ ЮKassa не настроена (отсутствуют SHOP_ID или SECRET_KEY)")
+
 bot = telebot.TeleBot(TOKEN)
 NOVOSIBIRSK_TZ = pytz_timezone('Asia/Novosibirsk')
-
 # Глобальные переменные
 questions_by_topic = {}
 topics_list = []
@@ -106,6 +128,21 @@ class Database:
                 total_answers INTEGER DEFAULT 0,
                 correct_answers INTEGER DEFAULT 0,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id) ON DELETE CASCADE
+            )
+            ''')
+
+            # ТАБЛИЦА ПЛАТЕЖЕЙ - ИСПРАВЛЕННАЯ ВЕРСИЯ
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                payment_id TEXT PRIMARY KEY,
+                telegram_id INTEGER NOT NULL,
+                amount REAL DEFAULT 250.00,
+                description TEXT,  -- ДОБАВЛЕНО ОПИСАНИЕ
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP,
+                is_processed BOOLEAN DEFAULT FALSE,
                 FOREIGN KEY (telegram_id) REFERENCES users (telegram_id) ON DELETE CASCADE
             )
             ''')
@@ -332,7 +369,7 @@ class Database:
                     end_datetime = datetime.now() + timedelta(days=1)
                 else:
                     # Обычная подписка: 30 дней от текущего момента
-                    end_datetime = datetime.now() + timedelta(days=30)
+                    end_datetime = datetime.now() + timedelta(days=300)
 
             # Форматируем даты в строки для базы данных
             start_str = start_datetime.strftime('%Y-%m-%d %H:%M:%S')
@@ -518,7 +555,7 @@ class Database:
             print(f"❌ Ошибка при изменении прав администратора: {e}")
             return False
 
-    def grant_subscription(self, telegram_id: int, days: int = 30) -> bool:
+    def grant_subscription(self, telegram_id: int, days: int = 300) -> bool:
         """Выдача подписки пользователю с точным временем"""
         try:
             conn = self.get_connection()
@@ -546,6 +583,69 @@ class Database:
 
         except sqlite3.Error as e:
             print(f"❌ Ошибка при выдаче подписки: {e}")
+            return False
+
+    def create_payment(self, payment_id: str, telegram_id: int, amount: float, description: str) -> bool:
+        """Создание записи о платеже"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            INSERT INTO payments (payment_id, telegram_id, amount, description, status)
+            VALUES (?, ?, ?, ?, 'pending')
+            ''', (payment_id, telegram_id, amount, description))
+
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"❌ Ошибка при создании платежа: {e}")
+            return False
+
+    def update_payment_status(self, payment_id: str, status: str) -> bool:
+        """Обновление статуса платежа"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            if status == 'succeeded':
+                cursor.execute('''
+                UPDATE payments 
+                SET status = ?, paid_at = CURRENT_TIMESTAMP
+                WHERE payment_id = ?
+                ''', (status, payment_id))
+            else:
+                cursor.execute('''
+                UPDATE payments 
+                SET status = ?
+                WHERE payment_id = ?
+                ''', (status, payment_id))
+
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"❌ Ошибка при обновлении статуса платежа: {e}")
+            return False
+
+    def mark_payment_processed(self, payment_id: str) -> bool:
+        """Отметка платежа как обработанного"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            UPDATE payments 
+            SET is_processed = TRUE
+            WHERE payment_id = ?
+            ''', (payment_id,))
+
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"❌ Ошибка при отметке платежа: {e}")
             return False
 
 
@@ -822,6 +922,55 @@ def check_and_load_questions() -> bool:
 # ============================================================================
 db = Database()
 
+
+def create_yookassa_payment(telegram_id: int) -> Optional[Dict]:
+    """Создание платежа в ЮKassa - упрощенная версия"""
+    try:
+        if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+            print("❌ ЮKassa не настроена")
+            return None
+
+        # Генерируем уникальный ID для платежа
+        payment_id = str(uuid.uuid4())
+
+        # Описание платежа
+        description = "Подписка на бота для подготовки к тестам (300 дней)"
+
+        # Создаем платеж в ЮKassa
+        payment = Payment.create({
+            "amount": {
+                "value": f"{SUBSCRIPTION_PRICE:.2f}",
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": f"https://t.me/{bot.get_me().username}"
+            },
+            "capture": True,
+            "description": description,
+            "metadata": {
+                "telegram_id": telegram_id,
+                "subscription_days": SUBSCRIPTION_DAYS
+            }
+        }, payment_id)
+
+        # Сохраняем платеж в базу данных
+        if db.create_payment(payment.id, telegram_id, SUBSCRIPTION_PRICE, description):
+            print(f"✅ Создан платеж {payment.id} для пользователя {telegram_id}")
+            return {
+                'id': payment.id,
+                'status': payment.status,
+                'confirmation_url': payment.confirmation.confirmation_url,
+                'amount': SUBSCRIPTION_PRICE,
+                'description': description
+            }
+        else:
+            print(f"❌ Не удалось сохранить платеж в БД")
+            return None
+
+    except Exception as e:
+        print(f"❌ Ошибка при создании платежа: {e}")
+        return None
 
 def check_user_access(chat_id: int, send_message: bool = True) -> bool:
     """Проверка доступа пользователя"""
@@ -1341,11 +1490,11 @@ def handle_grant_sub(message):
     try:
         parts = message.text.split()
         if len(parts) < 2:
-            bot.send_message(chat_id, "❌ Использование: /grant_sub <user_id> [days=30]")
+            bot.send_message(chat_id, "❌ Использование: /grant_sub <user_id> [days=300]")
             return
 
         target_id = int(parts[1])
-        days = 30 if len(parts) < 3 else int(parts[2])
+        days = 300 if len(parts) < 3 else int(parts[2])
 
         if db.grant_subscription(target_id, days):
             bot.send_message(chat_id, f"✅ Пользователю {target_id} выдана подписка на {days} дней")
@@ -1357,6 +1506,51 @@ def handle_grant_sub(message):
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка: {e}")
 
+
+@bot.message_handler(commands=['checkmypayment'])
+def handle_check_my_payment(message):
+    """Проверка последнего платежа пользователя"""
+    chat_id = message.chat.id
+
+    try:
+        conn = db.get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute('''
+        SELECT payment_id, status, created_at 
+        FROM payments 
+        WHERE telegram_id = ? 
+        ORDER BY created_at DESC 
+        LIMIT 1
+        ''', (chat_id,))
+
+        payment = cursor.fetchone()
+        conn.close()
+
+        if not payment:
+            bot.send_message(chat_id, "📭 У вас нет активных платежей")
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("🔄 Проверить статус", callback_data=f"check_payment_{payment['payment_id']}"))
+
+        bot.send_message(
+            chat_id,
+            f"""📋 <b>Ваш последний платеж</b>
+
+🆔 ID: {payment['payment_id'][:8]}...
+📅 Дата: {payment['created_at'][:19]}
+📊 Статус: {payment['status']}
+
+Нажмите кнопку ниже для проверки текущего статуса:""",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['set_admin'])
 def handle_set_admin(message):
@@ -1433,7 +1627,6 @@ def random_question_callback(call):
 
     # Отправляем вопрос
     bot.answer_callback_query(call.id, "🎲 Загружаю случайный вопрос...")
-    time.sleep(0.1)  # Небольшая задержка
 
     send_question_inline(chat_id, message_id)
 
@@ -1508,14 +1701,12 @@ def get_question_callback(call):
     # Удаляем ответ на callback, чтобы не было двойных сообщений
     bot.answer_callback_query(call.id, "🔄 Загружаю вопрос...")
 
-    # Небольшая задержка для предотвращения двойного срабатывания
-    time.sleep(0.1)
 
     send_question_inline(chat_id, message_id)
 
 
 def subscribe_info_callback(call):
-    """Обработчик информации о подписке с точным временем"""
+    """Обработчик информации о подписке"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
@@ -1524,49 +1715,33 @@ def subscribe_info_callback(call):
 
     if has_subscription and user and user.get('subscription_end_date'):
         try:
-            # Пытаемся парсить с точным временем
             end_datetime = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
             end_str = end_datetime.strftime("%d.%m.%Y в %H:%M")
 
-            # Рассчитываем оставшееся время
             time_left = end_datetime - datetime.now()
-
             if time_left.total_seconds() > 0:
                 days = time_left.days
                 hours = time_left.seconds // 3600
-                minutes = (time_left.seconds % 3600) // 60
 
                 if days > 0:
                     time_left_str = f"{days} дн. {hours} ч."
                 elif hours > 0:
-                    time_left_str = f"{hours} ч. {minutes} мин."
+                    time_left_str = f"{hours} ч."
                 else:
-                    time_left_str = f"{minutes} мин."
+                    time_left_str = f"менее часа"
 
                 status_text = f"✅ <b>Подписка активна</b>\nДействует до: {end_str}\nОсталось: {time_left_str}"
             else:
                 status_text = "❌ <b>Подписка истекла</b>"
-
-        except ValueError:
-            # Если старый формат (только дата)
-            try:
-                end_date = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d').date()
-                end_str = end_date.strftime("%d.%m.%Y")
-                days_left = (end_date - datetime.now().date()).days
-
-                if days_left > 0:
-                    status_text = f"✅ <b>Подписка активна</b>\nДействует до: {end_str}\nОсталось дней: {days_left}"
-                else:
-                    status_text = "❌ <b>Подписка истекла</b>"
-            except:
-                status_text = "✅ <b>Подписка активна</b>"
+        except:
+            status_text = "✅ <b>Подписка активна</b>"
     else:
         status_text = "❌ <b>Подписка не активна</b>"
 
     markup = types.InlineKeyboardMarkup()
     if not has_subscription:
         markup.add(
-            types.InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe"),
+            types.InlineKeyboardButton("💳 Оплатить подписку (250₽)", callback_data="pay_now"),
             types.InlineKeyboardButton("🎁 Пробный доступ", callback_data="trial")
         )
     markup.add(types.InlineKeyboardButton("📋 Условия подписки", callback_data="subscription_terms"))
@@ -1577,10 +1752,8 @@ def subscribe_info_callback(call):
 
 {status_text}
 
-📋 <b>Тарифы:</b>
-• 1 месяц - 299₽
-• 3 месяца - 807₽ (скидка 10%)
-• 6 месяцев - 1435₽ (скидка 20%)
+💰 <b>Тариф:</b>
+• 300 дней - 250₽
 
 🎁 <b>Пробный период:</b> 1 день бесплатно
 📞 <b>Поддержка:</b> @ZlotaR
@@ -1597,29 +1770,101 @@ def subscribe_info_callback(call):
 
 
 def subscribe_callback(call):
-    """Обработчик оформления подписки"""
+    """Обработчик оформления подписки - одна цена"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("💳 1 месяц - 299₽", callback_data="pay_1month"),
-        types.InlineKeyboardButton("💳 3 месяца - 807₽", callback_data="pay_3months")
-    )
-    markup.add(
-        types.InlineKeyboardButton("💳 6 месяцев - 1435₽", callback_data="pay_6months"),
-        types.InlineKeyboardButton("📋 Инструкция по оплате", callback_data="payment_instructions")
-    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("💳 Оплатить 250₽", callback_data="pay_now"))
+    markup.add(types.InlineKeyboardButton("📋 Условия подписки", callback_data="subscription_terms"))
     markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="subscribe_info"))
 
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
-        text="💳 <b>Оформление подписки</b>\n\nВыберите тариф:",
+        text="""💳 <b>Оформление подписки</b>
+
+💰 <b>Стоимость:</b> 250₽
+📅 <b>Срок:</b> 300 дней
+🎁 <b>Что входит:</b>
+• Полный доступ ко всем темам
+• Неограниченное количество вопросов
+• Статистика ответов
+• Поддержка 24/7
+
+👇 Нажмите "Оплатить 250₽" для продолжения""",
         parse_mode='HTML',
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
+
+
+def pay_now_callback(call):
+    """Обработчик оплаты"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    # Проверяем, настроена ли ЮKassa
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📞 Связь с поддержкой", url="https://t.me/ZlotaR"))
+        markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="subscribe"))
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⚠️ <b>Система оплаты временно недоступна</b>\n\nПожалуйста, свяжитесь с поддержкой для оформления подписки:\n@ZlotaR",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id, "❌ Система оплаты недоступна")
+        return
+
+    bot.answer_callback_query(call.id, "🔄 Создаю платеж...")
+
+    # Создаем платеж
+    payment_info = create_yookassa_payment(chat_id)
+
+    if not payment_info:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔄 Попробовать снова", callback_data="pay_now"))
+        markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="❌ <b>Не удалось создать платеж</b>\n\nПожалуйста, попробуйте снова или обратитесь в поддержку.",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("💳 Перейти к оплате", url=payment_info['confirmation_url']))
+    markup.add(types.InlineKeyboardButton("✅ Проверить оплату", callback_data=f"check_payment_{payment_info['id']}"))
+    markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+    markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="subscribe"))
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=f"""💳 <b>Оплата подписки</b>
+
+💰 Сумма: {SUBSCRIPTION_PRICE}₽
+📅 Срок: {SUBSCRIPTION_DAYS} дней
+
+👇 <b>Инструкция:</b>
+1. Нажмите <b>"Перейти к оплате"</b>
+2. Оплатите 250₽ удобным способом
+3. После оплаты вернитесь в бот
+4. Нажмите <b>"Проверить оплату"</b>
+
+⚠️ <b>Важно:</b>
+• Сохраните квитанцию об оплате
+• При проблемах - обращайтесь в поддержку""",
+        parse_mode='HTML',
+        reply_markup=markup
+    )
 
 
 def trial_callback(call):
@@ -1950,7 +2195,7 @@ def admin_grant_sub_callback(call):
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
-        text="🔑 <b>Выдача подписки</b>\n\nИспользуйте команду:\n<code>/grant_sub &lt;user_id&gt; [days]</code>\n\nПример:\n<code>/grant_sub 123456789 30</code>",
+        text="🔑 <b>Выдача подписки</b>\n\nИспользуйте команду:\n<code>/grant_sub &lt;user_id&gt; [days]</code>\n\nПример:\n<code>/grant_sub 123456789 300</code>",
         parse_mode='HTML',
         reply_markup=markup
     )
@@ -2094,42 +2339,38 @@ def top_players_callback(call):
 
 
 def subscription_terms_callback(call):
-    """Условия подписки"""
+    """Условия подписки - упрощенные"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
-    terms_text = """
+    terms_text = f"""
 📋 <b>Условия подписки</b>
 
-✅ <b>Что входит в подписку:</b>
+✅ <b>Что входит в подписку за {SUBSCRIPTION_PRICE}₽:</b>
 • Полный доступ ко всем темам
 • Неограниченное количество вопросов
 • Статистика ответов
 • Поддержка 24/7
-• Регулярное обновление базы вопросов
 
 ⏱️ <b>Срок действия:</b>
-• Подписка активируется после оплаты
-• Действует 30 дней с момента активации
+• Подписка на {SUBSCRIPTION_DAYS} дней
+• Активируется сразу после оплаты
 • Автопродление не предусмотрено
 
 💰 <b>Стоимость:</b>
-• 1 месяц - 299₽
-• 3 месяца - 807₽ (экономия 90₽)
-• 6 месяцев - 1435₽ (экономия 359₽)
+• {SUBSCRIPTION_PRICE}₽ за {SUBSCRIPTION_DAYS} дней
 
 🔄 <b>Возврат средств:</b>
-• Возврат возможен в течение 24 часов после оплаты
+• Возврат возможен в течение 24 часов
 • Для возврата обратитесь в поддержку
 
-📞 <b>Контакты поддержки:</b>
-• Telegram: @your_support
-• Email: support@example.com
+📞 <b>Поддержка:</b>
+• Telegram: @ZlotaR
 • Ответ в течение 24 часов
     """
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe"))
+    markup.add(types.InlineKeyboardButton("💳 Оплатить подписку", callback_data="pay_now"))
     markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="subscribe_info"))
 
     bot.edit_message_text(
@@ -2142,37 +2383,102 @@ def subscription_terms_callback(call):
     bot.answer_callback_query(call.id)
 
 
-def pay_callback(call):
-    """Оплата подписки"""
+def check_payment_callback(call):
+    """Проверка статуса платежа (без вебхуков)"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
-    plan = call.data.split('_')[1]
-    plans = {
-        '1month': {'price': 299, 'days': 30, 'name': '1 месяц'},
-        '3months': {'price': 807, 'days': 90, 'name': '3 месяца'},
-        '6months': {'price': 1435, 'days': 180, 'name': '6 месяцев'}
-    }
+    payment_id = call.data.split('_')[2]
 
-    if plan not in plans:
-        bot.answer_callback_query(call.id, "❌ Неверный тариф!")
-        return
+    bot.answer_callback_query(call.id, "🔄 Проверяем статус оплаты...")
 
-    plan_info = plans[plan]
+    # Проверяем статус платежа
+    try:
+        payment = Payment.find_one(payment_id)
 
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💳 Перейти к оплате", url=f"https://your_payment_link.com?plan={plan}"))
-    markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
-    markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="subscribe"))
+        # Обновляем статус в базе данных
+        db.update_payment_status(payment_id, payment.status)
 
-    bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=message_id,
-        text=f"💳 <b>Оплата подписки: {plan_info['name']}</b>\n\nСумма: {plan_info['price']}₽\nСрок: {plan_info['days']} дней",
-        parse_mode='HTML',
-        reply_markup=markup
-    )
-    bot.answer_callback_query(call.id)
+        if payment.status == 'succeeded':
+            # Платеж успешен
+            telegram_id = payment.metadata.get('telegram_id', chat_id)
+
+            # Активируем подписку на 300 дней
+            end_datetime = datetime.now() + timedelta(days=300)
+            db.update_subscription(telegram_id, True, end_datetime)
+
+            # Помечаем платеж как обработанный
+            db.mark_payment_processed(payment_id)
+
+            end_str = end_datetime.strftime("%d.%m.%Y в %H:%M")
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🚀 Начать обучение", callback_data="main_menu"))
+            markup.add(types.InlineKeyboardButton("📚 Выбрать тему", callback_data="change_topic"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"""✅ <b>Оплата успешно завершена!</b>
+
+💰 Сумма: {SUBSCRIPTION_PRICE}₽
+📅 Подписка активна до: {end_str}
+🎉 Теперь вам доступны все функции бота!
+
+Приятного обучения!""",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+        elif payment.status == 'pending':
+            # Платеж в обработке
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Проверить снова", callback_data=f"check_payment_{payment_id}"))
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⏳ <b>Оплата в обработке</b>\n\nПлатеж получен, но еще не подтвержден.\nПодождите 1-2 минуты и проверьте снова.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+        else:
+            # Платеж отменен или отклонен
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💳 Попробовать снова", callback_data="pay_now"))
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+            status_text = {
+                'canceled': 'отменен',
+                'failed': 'не прошел',
+                'rejected': 'отклонен',
+                'waiting_for_capture': 'ожидает подтверждения'
+            }.get(payment.status, payment.status)
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"❌ <b>Платеж {status_text}</b>\n\nПожалуйста, попробуйте снова или обратитесь в поддержку.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+    except Exception as e:
+        print(f"❌ Ошибка при проверке платежа: {e}")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔄 Проверить снова", callback_data=f"check_payment_{payment_id}"))
+        markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⚠️ <b>Не удалось проверить статус платежа</b>\n\nПожалуйста, попробуйте позже или обратитесь в поддержку.",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+
 
 
 def select_topic_callback(call):
@@ -2585,9 +2891,6 @@ def handle_callback_query(call):
 
         print(f"🔄 Callback: {call.data} от {chat_id}")
 
-        # Добавляем задержку для предотвращения двойных нажатий
-        time.sleep(0.05)
-
         # Маршрутизация по типам callback
         if call.data == "main_menu":
             main_menu_callback(call)
@@ -2619,8 +2922,12 @@ def handle_callback_query(call):
             top_players_callback(call)
         elif call.data == "subscription_terms":
             subscription_terms_callback(call)
-        elif call.data.startswith('pay_'):
-            pay_callback(call)
+        elif call.data == "pay_now":
+            # pay_now_callback(call)
+            bot.answer_callback_query(call.id, "⏸️ Оплата временно недоступна")
+            return
+        elif call.data.startswith('check_payment_'):
+            check_payment_callback(call)
         elif call.data == "payment_instructions":
             payment_instructions_callback(call)
         # Добавляем обработку админских callback-ов
@@ -2825,11 +3132,112 @@ def shutdown_handler(signum=None, frame=None):
     sys.exit(0)
 
 
+def setup_admin_from_env():
+    """Назначение администратора через переменную окружения ADMIN_IDS"""
+    try:
+        # Получаем список ID администраторов из переменной окружения
+        admin_ids_str = os.getenv('ADMIN_IDS', '')
+
+        if not admin_ids_str:
+            print("⚠️ Переменная окружения ADMIN_IDS не установлена")
+            return False
+
+        # Парсим ID администраторов (могут быть разделены запятыми или пробелами)
+        admin_ids = []
+        for item in admin_ids_str.replace(',', ' ').split():
+            try:
+                admin_id = int(item.strip())
+                admin_ids.append(admin_id)
+            except ValueError:
+                print(f"⚠️ Некорректный ID администратора: {item}")
+
+        if not admin_ids:
+            print("⚠️ Не удалось распарсить ID администраторов")
+            return False
+
+        print(f"👑 Настройка администраторов из переменных окружения: {admin_ids}")
+
+        # Подключаемся к базе данных
+        db_path = 'data/users.db'
+        if not os.path.exists(db_path):
+            print(f"❌ База данных не найдена: {db_path}")
+            return False
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Обновляем статус администратора для указанных ID
+        updated_count = 0
+        for admin_id in admin_ids:
+            try:
+                # Сначала проверяем, существует ли пользователь
+                cursor.execute('SELECT telegram_id FROM users WHERE telegram_id = ?', (admin_id,))
+                user_exists = cursor.fetchone()
+
+                if user_exists:
+                    # Обновляем существующего пользователя
+                    cursor.execute('''
+                    UPDATE users 
+                    SET is_admin = TRUE,
+                        last_activity = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                    ''', (admin_id,))
+                    print(f"✅ Пользователь {admin_id} назначен администратором")
+                else:
+                    # Создаем нового пользователя как администратора
+                    cursor.execute('''
+                    INSERT INTO users (telegram_id, is_admin, registration_date, last_activity)
+                    VALUES (?, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ''', (admin_id,))
+                    print(f"✅ Создан новый пользователь {admin_id} с правами администратора")
+
+                updated_count += 1
+
+            except sqlite3.Error as e:
+                print(f"❌ Ошибка при назначении администратора {admin_id}: {e}")
+
+        conn.commit()
+        conn.close()
+
+        print(f"✅ Успешно настроено {updated_count} администраторов")
+        return True
+
+    except Exception as e:
+        print(f"❌ Ошибка при настройке администраторов: {e}")
+        return False
+
+
+# ============================================================================
+# ФУНКЦИЯ ДЛЯ ОДНОРАЗОВОГО ВЫПОЛНЕНИЯ ПРИ ЗАПУСКЕ
+# ============================================================================
+
+def run_startup_tasks():
+    """Задачи, выполняемые один раз при запуске бота"""
+    print("=" * 50)
+    print("🚀 Выполнение стартовых задач...")
+    print("=" * 50)
+
+    # Назначение администраторов из переменных окружения
+    if setup_admin_from_env():
+        print("✅ Назначение администраторов выполнено успешно")
+    else:
+        print("⚠️ Назначение администраторов не выполнено")
+
+    # Здесь можно добавить другие стартовые задачи
+    # Например, проверку структуры базы данных, создание необходимых таблиц и т.д.
+
+    print("=" * 50)
+    print("✅ Стартовые задачи выполнены")
+    print("=" * 50)
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Запуск бота...")
     print("=" * 50)
 
+    # Выполняем стартовые задачи
+    run_startup_tasks()
     # Загружаем вопросы
     check_and_load_questions()
 
