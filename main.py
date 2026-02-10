@@ -35,10 +35,10 @@ load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен в переменных окружения!")
-
+user_extend_states = {}
 # Конфигурация ЮKassa - одна цена
-SUBSCRIPTION_PRICE = 250  # Одна цена: 250 рублей за месяц
-SUBSCRIPTION_DAYS = 300    # 30 дней подписка
+SUBSCRIPTION_PRICE = 69  # Одна цена: 69 рублей за месяц
+SUBSCRIPTION_DAYS = 30    # 30 дней подписка
 
 # Ключи ЮKassa
 YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID')
@@ -64,6 +64,53 @@ questions_loaded = False
 session_stats = {}
 user_data = {}
 scheduler = None
+
+
+def setup_logging():
+    """Настройка системы логирования"""
+    # Создаем папку /data если её нет
+    log_dir = 'data'
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        print(f"✅ Создана папка {log_dir}")
+
+    # Правильный путь к файлу логов
+    log_file = os.path.join(log_dir, 'bot.log')
+
+    # Настраиваем логирование
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            RotatingFileHandler(
+                log_file,  # Теперь это правильный путь: data/bot.log
+                maxBytes=10 * 1024 * 1024,  # 10 MB
+                backupCount=5,
+                encoding='utf-8'
+            ),
+            logging.StreamHandler()  # Также выводим в консоль
+        ]
+    )
+
+    print(f"✅ Логирование настроено. Файл логов: {log_file}")
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ УДОБНОГО ЛОГИРОВАНИЯ
+# ============================================================================
+def log_user_action(user_id: int, action: str, details: str = ""):
+    """Логирование действий пользователя"""
+    user_info = db.get_user(user_id)
+    username = f"@{user_info.get('username', 'нет')}" if user_info else "неизвестен"
+    log_msg = f"👤 Пользователь {user_id} ({username}): {action}"
+    if details:
+        log_msg += f" - {details}"
+    logger.info(log_msg)
+
+
 # Настройка повторных попыток для requests
 def setup_retry_session():
     session = requests.Session()
@@ -137,7 +184,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS payments (
                 payment_id TEXT PRIMARY KEY,
                 telegram_id INTEGER NOT NULL,
-                amount REAL DEFAULT 250.00,
+                amount REAL DEFAULT 69.00,
                 description TEXT,  -- ДОБАВЛЕНО ОПИСАНИЕ
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -356,24 +403,48 @@ class Database:
             return False
 
     def update_subscription(self, telegram_id: int, paid_status=True, end_datetime=None, is_trial=False) -> bool:
-        """Обновление подписки с точным временем окончания"""
+        """Обновление подписки с точным временем окончания - ИСПРАВЛЕННАЯ"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
 
-            start_datetime = datetime.now()
+            # Получаем текущую дату окончания подписки
+            cursor.execute('''
+            SELECT subscription_end_date, subscription_paid 
+            FROM users 
+            WHERE telegram_id = ?
+            ''', (telegram_id,))
 
-            if not end_datetime:
-                if is_trial:
-                    # Пробная подписка: 1 день от текущего момента
-                    end_datetime = datetime.now() + timedelta(days=1)
+            result = cursor.fetchone()
+            current_end_datetime = None
+
+            if result and result[0] and result[1]:  # Есть активная подписка
+                try:
+                    current_end_datetime = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+                except:
+                    current_end_datetime = None
+
+            # Определяем новую дату окончания
+            if end_datetime:
+                # Если передана конкретная дата
+                new_end_datetime = end_datetime
+            elif is_trial:
+                # Пробная подписка: 1 день от текущего момента или от текущей даты окончания
+                if current_end_datetime and current_end_datetime > datetime.now():
+                    new_end_datetime = current_end_datetime + timedelta(days=1)
                 else:
-                    # Обычная подписка: 30 дней от текущего момента
-                    end_datetime = datetime.now() + timedelta(days=300)
+                    new_end_datetime = datetime.now() + timedelta(days=1)
+            else:
+                # Обычная подписка: 30 дней от текущего момента или от текущей даты окончания
+                if current_end_datetime and current_end_datetime > datetime.now():
+                    new_end_datetime = current_end_datetime + timedelta(days=30)
+                else:
+                    new_end_datetime = datetime.now() + timedelta(days=30)
 
             # Форматируем даты в строки для базы данных
+            start_datetime = datetime.now()
             start_str = start_datetime.strftime('%Y-%m-%d %H:%M:%S')
-            end_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
+            end_str = new_end_datetime.strftime('%Y-%m-%d %H:%M:%S')
 
             if is_trial:
                 cursor.execute('''
@@ -397,7 +468,9 @@ class Database:
 
             conn.commit()
             conn.close()
-            print(f"✅ Подписка пользователя {telegram_id} обновлена до {end_str}")
+
+            logger.info(
+                f"Подписка пользователя {telegram_id} обновлена до {end_str} (была: {result[0] if result else 'нет'})")
             return True
 
         except sqlite3.Error as e:
@@ -531,6 +604,43 @@ class Database:
             print(f"❌ Ошибка при сбросе статистики: {e}")
             return False
 
+    def is_payment_processed(self, payment_id: str) -> bool:
+        """Проверка, был ли платеж уже обработан"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            SELECT is_processed FROM payments WHERE payment_id = ?
+            ''', (payment_id,))
+
+            result = cursor.fetchone()
+            conn.close()
+
+            return result and result[0] == 1
+        except Exception as e:
+            logger.error(f"Ошибка при проверке платежа {payment_id}: {e}")
+            return False
+
+    def get_payment_by_external_id(self, external_id: str):
+        """Получение платежа по внешнему ID"""
+        try:
+            conn = self.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            SELECT * FROM payments WHERE payment_id = ?
+            ''', (external_id,))
+
+            result = cursor.fetchone()
+            conn.close()
+
+            return dict(result) if result else None
+        except Exception as e:
+            logger.error(f"Ошибка при получении платежа {external_id}: {e}")
+            return None
+
     def set_admin(self, telegram_id: int, is_admin: bool = True) -> bool:
         """Назначение/снятие администратора"""
         try:
@@ -555,7 +665,7 @@ class Database:
             print(f"❌ Ошибка при изменении прав администратора: {e}")
             return False
 
-    def grant_subscription(self, telegram_id: int, days: int = 300) -> bool:
+    def grant_subscription(self, telegram_id: int, days: int = 30) -> bool:
         """Выдача подписки пользователю с точным временем"""
         try:
             conn = self.get_connection()
@@ -584,6 +694,121 @@ class Database:
         except sqlite3.Error as e:
             print(f"❌ Ошибка при выдаче подписки: {e}")
             return False
+
+    def extend_subscription(self, telegram_id: int, hours: int = 0, days: int = 0) -> bool:
+        """Продление подписки пользователю на указанное время"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            # Получаем текущие данные подписки
+            cursor.execute('''
+            SELECT subscription_end_date, subscription_paid 
+            FROM users 
+            WHERE telegram_id = ?
+            ''', (telegram_id,))
+
+            result = cursor.fetchone()
+
+            if not result:
+                conn.close()
+                return False
+
+            current_end_date_str, subscription_paid = result
+
+            # Определяем новую дату окончания
+            if current_end_date_str and subscription_paid:
+                try:
+                    # Если есть активная подписка, продлеваем от текущей даты окончания
+                    current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
+                    new_end = current_end + timedelta(days=days, hours=hours)
+                except ValueError:
+                    # Если формат неверный, продлеваем от текущего момента
+                    new_end = datetime.now() + timedelta(days=days, hours=hours)
+            else:
+                # Если подписки нет, начинаем с текущего момента
+                new_end = datetime.now() + timedelta(days=days, hours=hours)
+
+            new_end_str = new_end.strftime('%Y-%m-%d %H:%M:%S')
+
+            # Обновляем дату окончания
+            cursor.execute('''
+            UPDATE users 
+            SET subscription_end_date = ?,
+                subscription_paid = TRUE,
+                last_activity = CURRENT_TIMESTAMP
+            WHERE telegram_id = ?
+            ''', (new_end_str, telegram_id))
+
+            conn.commit()
+            conn.close()
+
+            # Логируем продление
+            logger.info(f"Подписка пользователя {telegram_id} продлена до {new_end_str} (+{days} дней, +{hours} часов)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при продлении подписки для {telegram_id}: {e}")
+            return False
+
+    def extend_all_active_subscriptions(self, hours: int = 0, days: int = 0) -> dict:
+        """Продление подписки всем пользователям с активной подпиской - ИСПРАВЛЕННАЯ"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            # Получаем всех пользователей с активной подпиской
+            cursor.execute('''
+            SELECT telegram_id, subscription_end_date 
+            FROM users 
+            WHERE subscription_paid = TRUE 
+            AND subscription_end_date IS NOT NULL
+            ''')
+
+            users = cursor.fetchall()
+            results = {
+                'total': len(users),
+                'success': 0,
+                'failed': 0,
+                'errors': []
+            }
+
+            for telegram_id, current_end_date_str in users:
+                try:
+                    if current_end_date_str:
+                        try:
+                            current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
+                            new_end = current_end + timedelta(days=days, hours=hours)
+                        except ValueError:
+                            # Если формат неверный, продлеваем от текущего момента
+                            new_end = datetime.now() + timedelta(days=days, hours=hours)
+                    else:
+                        new_end = datetime.now() + timedelta(days=days, hours=hours)
+
+                    new_end_str = new_end.strftime('%Y-%m-%d %H:%M:%S')
+
+                    cursor.execute('''
+                    UPDATE users 
+                    SET subscription_end_date = ?,
+                        last_activity = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                    ''', (new_end_str, telegram_id))
+
+                    results['success'] += 1
+                    logger.info(f"Подписка продлена для {telegram_id} до {new_end_str}")
+
+                except Exception as e:
+                    results['failed'] += 1
+                    results['errors'].append(f"{telegram_id}: {str(e)}")
+                    logger.error(f"Ошибка продления для {telegram_id}: {e}")
+
+            conn.commit()
+            conn.close()
+            return results
+
+        except Exception as e:
+            logger.error(f"Ошибка при массовом продлении подписок: {e}")
+            return {'total': 0, 'success': 0, 'failed': 0, 'errors': [str(e)]}
 
     def create_payment(self, payment_id: str, telegram_id: int, amount: float, description: str) -> bool:
         """Создание записи о платеже"""
@@ -934,7 +1159,7 @@ def create_yookassa_payment(telegram_id: int) -> Optional[Dict]:
         payment_id = str(uuid.uuid4())
 
         # Описание платежа
-        description = "Подписка на бота для подготовки к тестам (300 дней)"
+        description = "Подписка на бота для подготовки к тестам (30 дней)"
 
         # Создаем платеж в ЮKassa
         payment = Payment.create({
@@ -1044,6 +1269,61 @@ def create_back_button(target: str = "main_menu") -> types.InlineKeyboardMarkup:
 
 
 # ============================================================================
+# НАСТРОЙКА КОМАНД БОТА
+# ============================================================================
+def setup_bot_commands():
+    """Настройка меню команд бота"""
+    try:
+        # Основные команды для всех пользователей
+        commands = [
+            types.BotCommand("start", "Главное меню"),
+            types.BotCommand("help", "Справка по командам"),
+            types.BotCommand("stats", "Ваша статистика"),
+            types.BotCommand("myinfo", "Информация о вас"),
+            types.BotCommand("checkmypayment", "Проверить мой платеж"),
+        ]
+
+        bot.set_my_commands(commands)
+        print("✅ Основные команды бота настроены")
+
+        # Команды для администраторов
+        admin_commands = [
+            types.BotCommand("start", "Главное меню"),
+            types.BotCommand("help", "Помощь"),
+            types.BotCommand("stats", "Статистика"),
+            types.BotCommand("myinfo", "Моя информация"),
+            types.BotCommand("admin", "Панель администратора"),
+            types.BotCommand("reload", "Перезагрузить вопросы"),
+            types.BotCommand("check_subs", "Проверить подписки"),
+            types.BotCommand("all_stats", "Вся статистика"),
+            types.BotCommand("scheduler_status", "Статус планировщика"),
+            types.BotCommand("reset_stats", "Сбросить статистику"),
+            types.BotCommand("grant_sub", "Выдать подписку"),
+            types.BotCommand("extend_sub", "Продлить подписку"),  # НОВАЯ КОМАНДА
+            types.BotCommand("set_admin", "Назначить админа"),
+            types.BotCommand("send_all_users", "Массовая рассылка"),
+        ]
+
+        # Настраиваем команды для администраторов
+        admin_ids = db.get_admin_ids()
+        for admin_id in admin_ids:
+            try:
+                bot.set_my_commands(
+                    admin_commands,
+                    scope=types.BotCommandScopeChat(admin_id)
+                )
+                print(f"✅ Админские команды настроены для {admin_id}")
+            except Exception as e:
+                print(f"⚠️ Ошибка настройки админских команд для {admin_id}: {e}")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Ошибка настройки команд бота: {e}")
+        return False
+
+
+# ============================================================================
 # ОСНОВНЫЕ ОБРАБОТЧИКИ СООБЩЕНИЙ (ВКЛЮЧАЯ АДМИНИСТРАТИВНЫЕ)
 # ============================================================================
 
@@ -1053,15 +1333,40 @@ def handle_help(message):
     """Обработчик команды /help"""
     chat_id = message.chat.id
 
+    # Проверяем, является ли пользователь администратором
+    user = db.get_user(chat_id)
+    is_admin = user and user.get('is_admin')
+
     help_text = """
 🆘 <b>Доступные команды:</b>
 
-/start - Главное меню
-/help - Эта справка
-/stats - Ваша статистика
-/myinfo - Информация о вас
+<code>/start</code> - Главное меню
+<code>/help</code> - Эта справка
+<code>/stats</code> - Ваша статистика
+<code>/myinfo</code> - Информация о вас
+<code>/checkmypayment</code> - Проверить мой платеж
+"""
+
+    if is_admin:
+        help_text += """
+
+👑 <b>Команды администратора:</b>
+<code>/admin</code> - Панель администратора
+<code>/reload</code> - Перезагрузить вопросы
+<code>/check_subs</code> - Проверить подписки
+<code>/all_stats</code> - Вся статистика
+<code>/scheduler_status</code> - Статус планировщика
+<code>/reset_stats</code> - Сбросить статистику
+<code>/grant_sub</code> - Выдать подписку
+<code>/set_admin</code> - Назначить админа
+<code>/send_all_users</code> - Массовая рассылка всем пользователям
+"""
+
+    help_text += """
 
 📞 <b>Поддержка:</b> @ZlotaR
+
+💡 <b>Совет:</b> Нажмите на кнопку меню (📎) рядом с полем ввода, чтобы увидеть все команды!
     """
 
     bot.send_message(chat_id, help_text, parse_mode='HTML')
@@ -1295,7 +1600,11 @@ def handle_admin(message):
     )
     markup.add(
         types.InlineKeyboardButton("🔑 Выдать подписку", callback_data="admin_grant_sub"),
-        types.InlineKeyboardButton("👑 Назначить админа", callback_data="admin_grant_admin")
+        types.InlineKeyboardButton("⏱️ Продлить подписку", callback_data="admin_extend_sub")  # НОВАЯ КНОПКА
+    )
+    markup.add(
+        types.InlineKeyboardButton("👑 Назначить админа", callback_data="admin_grant_admin"),
+        types.InlineKeyboardButton("📢 Массовая рассылка", callback_data="admin_broadcast")
     )
     markup.add(
         types.InlineKeyboardButton("📝 Логи", callback_data="admin_logs"),
@@ -1490,11 +1799,11 @@ def handle_grant_sub(message):
     try:
         parts = message.text.split()
         if len(parts) < 2:
-            bot.send_message(chat_id, "❌ Использование: /grant_sub <user_id> [days=300]")
+            bot.send_message(chat_id, "❌ Использование: /grant_sub <user_id> [days=30]")
             return
 
         target_id = int(parts[1])
-        days = 300 if len(parts) < 3 else int(parts[2])
+        days = 30 if len(parts) < 3 else int(parts[2])
 
         if db.grant_subscription(target_id, days):
             bot.send_message(chat_id, f"✅ Пользователю {target_id} выдана подписка на {days} дней")
@@ -1548,6 +1857,98 @@ def handle_check_my_payment(message):
             parse_mode='HTML',
             reply_markup=markup
         )
+
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+
+
+@bot.message_handler(commands=['extend_sub'])
+def handle_extend_sub(message):
+    """Команда для продления подписки"""
+    chat_id = message.chat.id
+    user = db.get_user(chat_id)
+
+    if not user or not user.get('is_admin'):
+        bot.send_message(chat_id, "❌ У вас нет прав администратора.", reply_markup=create_main_menu())
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) < 4:
+            bot.send_message(
+                chat_id,
+                "❌ <b>Использование:</b>\n"
+                "<code>/extend_sub &lt;user_id&gt; &lt;days&gt; &lt;hours&gt;</code>\n\n"
+                "<b>Примеры:</b>\n"
+                "<code>/extend_sub 123456789 7 0</code> - продлить на 7 дней\n"
+                "<code>/extend_sub 123456789 0 12</code> - продлить на 12 часов\n"
+                "<code>/extend_sub all 3 0</code> - продлить всем активным на 3 дня",
+                parse_mode='HTML'
+            )
+            return
+
+        if parts[1].lower() == 'all':
+            # Продление всем
+            days = int(parts[2])
+            hours = int(parts[3])
+
+            result = db.extend_all_active_subscriptions(hours=hours, days=days)
+
+            time_text = ""
+            if hours > 0 and days > 0:
+                time_text = f"{hours} час(ов) и {days} день(ей)"
+            elif hours > 0:
+                time_text = f"{hours} час(ов)"
+            elif days > 0:
+                time_text = f"{days} день(ей)"
+
+            report = f"✅ <b>Массовое продление завершено!</b>\n\n"
+            report += f"📅 Срок: {time_text}\n"
+            report += f"👥 Всего пользователей: {result['total']}\n"
+            report += f"✅ Успешно: {result['success']}\n"
+            report += f"❌ Ошибок: {result['failed']}"
+
+            bot.send_message(chat_id, report, parse_mode='HTML')
+
+        else:
+            # Продление конкретному пользователю
+            user_id = int(parts[1])
+            days = int(parts[2])
+            hours = int(parts[3])
+
+            if db.extend_subscription(user_id, hours=hours, days=days):
+                user_info = db.get_user(user_id)
+                end_date = user_info.get('subscription_end_date', 'неизвестно')
+
+                time_text = ""
+                if hours > 0 and days > 0:
+                    time_text = f"{hours} час(ов) и {days} день(ей)"
+                elif hours > 0:
+                    time_text = f"{hours} час(ов)"
+                elif days > 0:
+                    time_text = f"{days} день(ей)"
+
+                report = f"✅ <b>Подписка продлена!</b>\n\n"
+                report += f"👤 Пользователь ID: {user_id}\n"
+                report += f"📅 Срок: {time_text}\n"
+                report += f"🕐 Действует до: {end_date}"
+
+                # Отправляем уведомление пользователю
+                try:
+                    notification = f"🎉 <b>Ваша подписка продлена!</b>\n\n"
+                    notification += f"Администратор продлил вашу подписку на {time_text}.\n"
+                    notification += f"Теперь она действует до: {end_date}"
+
+                    bot.send_message(user_id, notification, parse_mode='HTML')
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+                    report += f"\n\n⚠️ Не удалось отправить уведомление пользователю"
+
+            else:
+                report = f"❌ <b>Не удалось продлить подписку</b>\n\n"
+                report += f"Пользователь ID: {user_id}"
+
+            bot.send_message(chat_id, report, parse_mode='HTML')
 
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка: {e}")
@@ -1704,7 +2105,6 @@ def get_question_callback(call):
 
     send_question_inline(chat_id, message_id)
 
-
 def subscribe_info_callback(call):
     """Обработчик информации о подписке"""
     chat_id = call.message.chat.id
@@ -1741,7 +2141,7 @@ def subscribe_info_callback(call):
     markup = types.InlineKeyboardMarkup()
     if not has_subscription:
         markup.add(
-            types.InlineKeyboardButton("💳 Оплатить подписку (250₽)", callback_data="pay_now"),
+            types.InlineKeyboardButton("💳 Оплатить подписку (69₽)", callback_data="pay_now"),
             types.InlineKeyboardButton("🎁 Пробный доступ", callback_data="trial")
         )
     markup.add(types.InlineKeyboardButton("📋 Условия подписки", callback_data="subscription_terms"))
@@ -1753,7 +2153,7 @@ def subscribe_info_callback(call):
 {status_text}
 
 💰 <b>Тариф:</b>
-• 300 дней - 250₽
+• 30 дней - 69₽
 
 🎁 <b>Пробный период:</b> 1 день бесплатно
 📞 <b>Поддержка:</b> @ZlotaR
@@ -1768,14 +2168,13 @@ def subscribe_info_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def subscribe_callback(call):
     """Обработчик оформления подписки - одна цена"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("💳 Оплатить 250₽", callback_data="pay_now"))
+    markup.add(types.InlineKeyboardButton("💳 Оплатить 69₽", callback_data="pay_now"))
     markup.add(types.InlineKeyboardButton("📋 Условия подписки", callback_data="subscription_terms"))
     markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="subscribe_info"))
 
@@ -1784,20 +2183,19 @@ def subscribe_callback(call):
         message_id=message_id,
         text="""💳 <b>Оформление подписки</b>
 
-💰 <b>Стоимость:</b> 250₽
-📅 <b>Срок:</b> 300 дней
+💰 <b>Стоимость:</b> 69₽
+📅 <b>Срок:</b> 30 дней
 🎁 <b>Что входит:</b>
 • Полный доступ ко всем темам
 • Неограниченное количество вопросов
 • Статистика ответов
 • Поддержка 24/7
 
-👇 Нажмите "Оплатить 250₽" для продолжения""",
+👇 Нажмите "Оплатить 69₽" для продолжения""",
         parse_mode='HTML',
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
-
 
 def pay_now_callback(call):
     """Обработчик оплаты"""
@@ -1855,7 +2253,7 @@ def pay_now_callback(call):
 
 👇 <b>Инструкция:</b>
 1. Нажмите <b>"Перейти к оплате"</b>
-2. Оплатите 250₽ удобным способом
+2. Оплатите 69₽ удобным способом
 3. После оплаты вернитесь в бот
 4. Нажмите <b>"Проверить оплату"</b>
 
@@ -1866,15 +2264,36 @@ def pay_now_callback(call):
         reply_markup=markup
     )
 
-
 def trial_callback(call):
-    """Обработчик пробного доступа с точным временем"""
+    """Обработчик пробного доступа с точным временем - ИСПРАВЛЕННАЯ"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
     # Проверяем, использовал ли уже пробный доступ
     user = db.get_user(chat_id)
     if user and user.get('is_trial_used'):
+        # Дополнительная проверка: возможно, пробный доступ уже истек
+        if user.get('subscription_end_date'):
+            try:
+                end_datetime = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
+                if end_datetime < datetime.now():
+                    # Пробный доступ истек, можно предложить платную подписку
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe"))
+                    markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="main_menu"))
+
+                    bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="❌ <b>Пробный доступ уже был использован!</b>\n\nСрок пробного периода истек. Оформите подписку для продолжения использования.",
+                        parse_mode='HTML',
+                        reply_markup=markup
+                    )
+                    bot.answer_callback_query(call.id, "❌ Пробный доступ уже был использован!")
+                    return
+            except:
+                pass
+
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe"))
         markup.add(types.InlineKeyboardButton("↩️ Назад", callback_data="main_menu"))
@@ -1891,6 +2310,18 @@ def trial_callback(call):
 
     # Даем пробный доступ на 1 день от текущего момента
     end_datetime = datetime.now() + timedelta(days=1)
+
+    # Проверяем, нет ли уже активной подписки
+    if user and user.get('subscription_paid') and user.get('subscription_end_date'):
+        try:
+            current_end = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
+            if current_end > datetime.now():
+                # Уже есть активная подписка
+                bot.answer_callback_query(call.id, "✅ У вас уже есть активная подписка!")
+                return
+        except:
+            pass
+
     db.update_subscription(chat_id, True, end_datetime, is_trial=True)
 
     markup = types.InlineKeyboardMarkup()
@@ -1907,7 +2338,6 @@ def trial_callback(call):
     )
     bot.answer_callback_query(call.id, "✅ Пробный доступ активирован!")
 
-
 def info_callback(call):
     """Обработчик информации о боте"""
     chat_id = call.message.chat.id
@@ -1923,7 +2353,6 @@ def info_callback(call):
 • Тем: {len(topics_list) - 1 if topics_list else 0}
 • Вопросов: {sum(len(q) for q in questions_by_topic.values()) if questions_by_topic else 0}
 
-👨‍💻 <b>Разработчик:</b> Ваша команда
 📞 <b>Поддержка:</b> @ZlotaR
     """
 
@@ -1936,7 +2365,6 @@ def info_callback(call):
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
-
 
 def help_menu_callback(call):
     """Обработчик помощи"""
@@ -1963,7 +2391,7 @@ def help_menu_callback(call):
 4. Отправьте чек в поддержку
 
 🔧 <b>Проблемы с ботом?</b>
-• Обратитесь в поддержку @your_support
+• Обратитесь в поддержку @ZlotaR
     """
 
     markup = types.InlineKeyboardMarkup()
@@ -1980,7 +2408,6 @@ def help_menu_callback(call):
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
-
 
 def check_questions_callback(call):
     """Обработчик проверки вопросов"""
@@ -2005,7 +2432,6 @@ def check_questions_callback(call):
             reply_markup=create_back_button("main_menu")
         )
     bot.answer_callback_query(call.id)
-
 
 def show_stats_message(chat_id, message_id=None):
     """Показать статистику пользователя - ДОБАВЬТЕ ЭТУ ФУНКЦИЮ"""
@@ -2067,6 +2493,288 @@ def show_stats_message(chat_id, message_id=None):
             reply_markup=markup
         )
 
+def admin_broadcast_callback(call):
+    """Массовая рассылка через админ-панель"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    # Сохраняем состояние пользователя
+    user_broadcast_states[chat_id] = {
+        'state': 'waiting_for_message',
+        'message': None,
+        'confirmed': False
+    }
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_broadcast"))
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text="📢 <b>МАССОВАЯ РАССЫЛКА</b>\n\n"
+             "Отправьте сообщение, которое хотите разослать всем пользователям бота.\n"
+             "Можно использовать HTML-разметку.\n\n"
+             "<i>Или нажмите кнопку Отмена для выхода</i>",
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+
+def admin_extend_sub_callback(call):
+    """Меню продления подписки"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("👤 Одному пользователю", callback_data="extend_user_menu"),
+        types.InlineKeyboardButton("👥 Всем активным", callback_data="extend_all_menu")
+    )
+    markup.add(types.InlineKeyboardButton("↩️ Назад в админку", callback_data="back_to_admin"))
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text="⏱️ <b>Продление подписки</b>\n\n"
+             "Выберите, кому продлить подписку:",
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+
+def extend_user_menu_callback(call):
+    """Меню продления подписки конкретному пользователю"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    # Сохраняем состояние
+    user_extend_states[chat_id] = {
+        'state': 'waiting_for_user_id',
+        'action': 'extend_user',
+        'user_id': None,
+        'hours': 0,
+        'days': 0
+    }
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="admin_extend_sub"))
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text="👤 <b>Продление подписки пользователю</b>\n\n"
+             "Отправьте ID пользователя, которому нужно продлить подписку:",
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+
+def extend_all_menu_callback(call):
+    """Меню продления подписки всем активным пользователям"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    markup = types.InlineKeyboardMarkup(row_width=3)
+
+    # Часы
+    markup.row(types.InlineKeyboardButton("🕐 +1 час", callback_data="extend_all_hours_1"),
+               types.InlineKeyboardButton("🕑 +3 часа", callback_data="extend_all_hours_3"),
+               types.InlineKeyboardButton("🕒 +6 часов", callback_data="extend_all_hours_6"))
+    markup.row(types.InlineKeyboardButton("🕓 +12 часов", callback_data="extend_all_hours_12"),
+               types.InlineKeyboardButton("🕔 +24 часа", callback_data="extend_all_hours_24"))
+
+    # Дни
+    markup.row(types.InlineKeyboardButton("📅 +1 день", callback_data="extend_all_days_1"),
+               types.InlineKeyboardButton("📅 +3 дня", callback_data="extend_all_days_3"),
+               types.InlineKeyboardButton("📅 +7 дней", callback_data="extend_all_days_7"))
+    markup.row(types.InlineKeyboardButton("📅 +14 дней", callback_data="extend_all_days_14"),
+               types.InlineKeyboardButton("📅 +30 дней", callback_data="extend_all_days_30"),
+               types.InlineKeyboardButton("📅 +60 дней", callback_data="extend_all_days_60"))
+
+    markup.row(types.InlineKeyboardButton("↩️ Назад", callback_data="admin_extend_sub"))
+
+    # Получаем статистику активных пользователей
+    all_users = db.get_all_users()
+    active_users = [u for u in all_users if db.check_subscription(u['telegram_id'])]
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=f"👥 <b>Продление подписки всем активным пользователям</b>\n\n"
+             f"📊 Активных подписок: {len(active_users)}\n\n"
+             "Выберите срок продления:",
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+
+def handle_extend_all_callback(call):
+    """Обработка выбора срока продления для всех"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    try:
+        # Парсим данные из callback (формат: extend_all_[тип]_[значение])
+        parts = call.data.split('_')
+
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id, "❌ Неверный формат команды")
+            return
+
+        time_type = parts[2]  # hours или days
+        value = int(parts[3])  # значение
+
+        # Устанавливаем часы и дни
+        hours = value if time_type == 'hours' else 0
+        days = value if time_type == 'days' else 0
+
+        # Создаем подтверждающее сообщение
+        time_text = ""
+        if hours > 0:
+            time_text = f"{hours} час(ов)"
+        elif days > 0:
+            time_text = f"{days} день(ей)"
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton(f"✅ Да, продлить на {time_text}",
+                                       callback_data=f"confirm_extend_all_{hours}_{days}"),
+            types.InlineKeyboardButton("❌ Нет, отмена", callback_data="extend_all_menu")
+        )
+
+        # Получаем статистику активных пользователей
+        all_users = db.get_all_users()
+        active_users = [u for u in all_users if db.check_subscription(u['telegram_id'])]
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"⚠️ <b>Подтверждение продления</b>\n\n"
+                 f"Вы уверены, что хотите продлить подписку ВСЕМ активным пользователям на {time_text}?\n\n"
+                 f"📊 Будет затронуто: {len(active_users)} пользователей",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id)
+
+    except Exception as e:
+        logger.error(f"Ошибка в handle_extend_all_callback: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка обработки запроса")
+
+
+def handle_confirm_extend_callback(call):
+    """Подтверждение и выполнение продления"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    try:
+        if call.data.startswith("confirm_extend_all_"):
+            # Продление всем
+            _, _, _, hours_str, days_str = call.data.split('_')
+            hours = int(hours_str)
+            days = int(days_str)
+
+            bot.answer_callback_query(call.id, "⏳ Продлеваю подписки...")
+
+            # Выполняем продление
+            result = db.extend_all_active_subscriptions(hours=hours, days=days)
+
+            # Формируем отчет
+            time_text = ""
+            if hours > 0 and days > 0:
+                time_text = f"{hours} час(ов) и {days} день(ей)"
+            elif hours > 0:
+                time_text = f"{hours} час(ов)"
+            elif days > 0:
+                time_text = f"{days} день(ей)"
+
+            report = f"✅ <b>Продление завершено!</b>\n\n"
+            report += f"📅 Срок: {time_text}\n"
+            report += f"👥 Всего пользователей: {result['total']}\n"
+            report += f"✅ Успешно: {result['success']}\n"
+            report += f"❌ Ошибок: {result['failed']}\n"
+
+            if result['errors']:
+                report += f"\n📝 Ошибки (первые 5):\n"
+                for error in result['errors'][:5]:
+                    report += f"• {error}\n"
+                if len(result['errors']) > 5:
+                    report += f"... и еще {len(result['errors']) - 5} ошибок"
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("↩️ Назад к продлению", callback_data="admin_extend_sub"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=report,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+        elif call.data.startswith("confirm_extend_user_"):
+            # Продление конкретному пользователю
+            parts = call.data.split('_')
+            user_id = int(parts[3])
+            hours = int(parts[4])
+            days = int(parts[5])
+
+            bot.answer_callback_query(call.id, "⏳ Продлеваю подписку...")
+
+            # Выполняем продление
+            if db.extend_subscription(user_id, hours=hours, days=days):
+                time_text = ""
+                if hours > 0 and days > 0:
+                    time_text = f"{hours} час(ов) и {days} день(ей)"
+                elif hours > 0:
+                    time_text = f"{hours} час(ов)"
+                elif days > 0:
+                    time_text = f"{days} день(ей)"
+
+                # Получаем обновленную информацию о пользователе
+                user = db.get_user(user_id)
+                end_date = user.get('subscription_end_date', 'неизвестно')
+
+                report = f"✅ <b>Подписка продлена!</b>\n\n"
+                report += f"👤 Пользователь ID: {user_id}\n"
+                report += f"📅 Срок: {time_text}\n"
+                report += f"🕐 Действует до: {end_date}\n"
+
+                # Отправляем уведомление пользователю
+                try:
+                    notification = f"🎉 <b>Ваша подписка продлена!</b>\n\n"
+                    notification += f"Администратор продлил вашу подписку на {time_text}.\n"
+                    notification += f"Теперь она действует до: {end_date}"
+
+                    bot.send_message(user_id, notification, parse_mode='HTML')
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+                    report += f"\n⚠️ Не удалось отправить уведомление пользователю"
+
+            else:
+                report = f"❌ <b>Не удалось продлить подписку</b>\n\n"
+                report += f"Пользователь ID: {user_id}\n"
+                report += f"Возможно, пользователь не найден или произошла ошибка."
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("↩️ Назад к продлению", callback_data="admin_extend_sub"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=report,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка в handle_confirm_extend_callback: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка при продлении")
+
 def handle_admin_callback(call):
     """Обработка административных callback-запросов"""
     chat_id = call.message.chat.id
@@ -2083,14 +2791,20 @@ def handle_admin_callback(call):
         admin_users_callback(call)
     elif call.data == "admin_grant_sub":
         admin_grant_sub_callback(call)
+    elif call.data == "admin_extend_sub":
+        admin_extend_sub_callback(call)
     elif call.data == "admin_grant_admin":
         admin_grant_admin_callback(call)
+    elif call.data == "admin_broadcast":
+        handle_send_all_users(call)
     elif call.data == "admin_logs":
         admin_logs_callback(call)
     elif call.data == "admin_restart":
         admin_restart_callback(call)
     elif call.data == "admin_db":
         admin_db_callback(call)
+    elif call.data.startswith("confirm_extend_"):  # Подтверждение продления
+        handle_confirm_extend_callback(call)
     elif call.data == "back_to_admin":
         back_to_admin_callback(call)
     elif call.data == "logs_last_100":
@@ -2145,7 +2859,6 @@ def admin_stats_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def admin_users_callback(call):
     """Список пользователей"""
     chat_id = call.message.chat.id
@@ -2182,7 +2895,6 @@ def admin_users_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def admin_grant_sub_callback(call):
     """Выдача подписки"""
     chat_id = call.message.chat.id
@@ -2195,12 +2907,11 @@ def admin_grant_sub_callback(call):
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
-        text="🔑 <b>Выдача подписки</b>\n\nИспользуйте команду:\n<code>/grant_sub &lt;user_id&gt; [days]</code>\n\nПример:\n<code>/grant_sub 123456789 300</code>",
+        text="🔑 <b>Выдача подписки</b>\n\nИспользуйте команду:\n<code>/grant_sub &lt;user_id&gt; [days]</code>\n\nПример:\n<code>/grant_sub 123456789 30</code>",
         parse_mode='HTML',
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
-
 
 def admin_grant_admin_callback(call):
     """Назначение администратора"""
@@ -2219,7 +2930,6 @@ def admin_grant_admin_callback(call):
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
-
 
 def admin_logs_callback(call):
     """Управление логами"""
@@ -2247,7 +2957,6 @@ def admin_logs_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def admin_restart_callback(call):
     """Перезагрузка бота"""
     chat_id = call.message.chat.id
@@ -2268,7 +2977,6 @@ def admin_restart_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def back_to_admin_callback(call):
     """Назад в админку"""
     chat_id = call.message.chat.id
@@ -2281,7 +2989,11 @@ def back_to_admin_callback(call):
     )
     markup.add(
         types.InlineKeyboardButton("🔑 Выдать подписку", callback_data="admin_grant_sub"),
-        types.InlineKeyboardButton("👑 Назначить админа", callback_data="admin_grant_admin")
+        types.InlineKeyboardButton("⏱️ Продлить подписку", callback_data="admin_extend_sub")  # НОВАЯ КНОПКА
+    )
+    markup.add(
+        types.InlineKeyboardButton("👑 Назначить админа", callback_data="admin_grant_admin"),
+        types.InlineKeyboardButton("📢 Массовая рассылка", callback_data="admin_broadcast")
     )
     markup.add(
         types.InlineKeyboardButton("📝 Логи", callback_data="admin_logs"),
@@ -2300,7 +3012,6 @@ def back_to_admin_callback(call):
         reply_markup=markup
     )
     bot.answer_callback_query(call.id)
-
 
 def top_players_callback(call):
     """Топ игроков"""
@@ -2337,7 +3048,6 @@ def top_players_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def subscription_terms_callback(call):
     """Условия подписки - упрощенные"""
     chat_id = call.message.chat.id
@@ -2356,13 +3066,12 @@ def subscription_terms_callback(call):
 • Подписка на {SUBSCRIPTION_DAYS} дней
 • Активируется сразу после оплаты
 • Автопродление не предусмотрено
+• Для продления подписки необходимо просто оплатить ещё раз,
+  оплаченные дни суммируются!
+
 
 💰 <b>Стоимость:</b>
 • {SUBSCRIPTION_PRICE}₽ за {SUBSCRIPTION_DAYS} дней
-
-🔄 <b>Возврат средств:</b>
-• Возврат возможен в течение 24 часов
-• Для возврата обратитесь в поддержку
 
 📞 <b>Поддержка:</b>
 • Telegram: @ZlotaR
@@ -2382,9 +3091,8 @@ def subscription_terms_callback(call):
     )
     bot.answer_callback_query(call.id)
 
-
 def check_payment_callback(call):
-    """Проверка статуса платежа (без вебхуков)"""
+    """Проверка статуса платежа (без вебхуков) - ИСПРАВЛЕННАЯ"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
@@ -2400,11 +3108,67 @@ def check_payment_callback(call):
         db.update_payment_status(payment_id, payment.status)
 
         if payment.status == 'succeeded':
-            # Платеж успешен
+            # Проверяем, не был ли платеж уже обработан
+            conn = db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute('''
+            SELECT is_processed, telegram_id 
+            FROM payments 
+            WHERE payment_id = ?
+            ''', (payment_id,))
+
+            payment_data = cursor.fetchone()
+            conn.close()
+
+            if payment_data and payment_data['is_processed']:
+                # Платеж уже был обработан ранее
+                bot.answer_callback_query(call.id, "✅ Платеж уже был обработан ранее")
+
+                # Просто показываем статус
+                user_info = db.get_user(chat_id)
+                end_date = user_info.get('subscription_end_date', 'неизвестно')
+
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("🚀 Начать обучение", callback_data="main_menu"))
+
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"""✅ <b>Платеж уже был обработан</b>
+
+💰 Сумма: {SUBSCRIPTION_PRICE}₽
+📅 Подписка активна до: {end_date}
+🎉 Теперь вам доступны все функции бота!""",
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+                return
+
+            # Платеж успешен и еще не обработан
             telegram_id = payment.metadata.get('telegram_id', chat_id)
 
-            # Активируем подписку на 300 дней
-            end_datetime = datetime.now() + timedelta(days=300)
+            # Проверяем, не была ли уже активирована подписка по этому платежу
+            user = db.get_user(telegram_id)
+            if user and user.get('subscription_paid'):
+                # У пользователя уже есть активная подписка
+                # Продлеваем от текущей даты окончания
+                current_end = None
+                if user.get('subscription_end_date'):
+                    try:
+                        current_end = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
+                    except:
+                        current_end = datetime.now()
+
+                if current_end:
+                    end_datetime = current_end + timedelta(days=30)
+                else:
+                    end_datetime = datetime.now() + timedelta(days=30)
+            else:
+                # Активируем новую подписку на 30 дней
+                end_datetime = datetime.now() + timedelta(days=30)
+
             db.update_subscription(telegram_id, True, end_datetime)
 
             # Помечаем платеж как обработанный
@@ -2480,6 +3244,512 @@ def check_payment_callback(call):
         )
 
 
+# ============================================================================
+# МАССОВАЯ РАССЫЛКА СООБЩЕНИЙ ВСЕМ ПОЛЬЗОВАТЕЛЯМ
+# ============================================================================
+
+# Словарь для хранения состояний пользователей при массовой рассылке
+user_broadcast_states = {}
+
+
+# Добавьте обработчик сообщений
+@bot.message_handler(func=lambda message: message.chat.id in user_extend_states and
+                                          user_extend_states[message.chat.id]['state'] == 'waiting_for_user_id')
+def handle_extend_user_id(message):
+    """Обработка ввода ID пользователя для продления"""
+    chat_id = message.chat.id
+    user_state = user_extend_states[chat_id]
+
+    try:
+        user_id = int(message.text.strip())
+        user_state['user_id'] = user_id
+
+        # Проверяем существование пользователя
+        user_info = db.get_user(user_id)
+        if not user_info:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Ввести другой ID", callback_data="extend_user_menu"),
+                       types.InlineKeyboardButton("↩️ Назад", callback_data="admin_extend_sub"))
+
+            bot.send_message(
+                chat_id,
+                f"❌ <b>Пользователь не найден</b>\n\n"
+                f"Пользователь с ID {user_id} не найден в базе данных.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            del user_extend_states[chat_id]
+            return
+
+        # Показываем информацию о пользователе
+        username = user_info.get('username', 'нет username')
+        first_name = user_info.get('first_name', 'неизвестно')
+        has_sub = "✅" if db.check_subscription(user_id) else "❌"
+        end_date = user_info.get('subscription_end_date', 'нет подписки')
+
+        markup = types.InlineKeyboardMarkup(row_width=3)
+
+        # Часы
+        markup.row(types.InlineKeyboardButton("🕐 +1 час", callback_data=f"extend_user_{user_id}_hours_1"),
+                   types.InlineKeyboardButton("🕑 +3 часа", callback_data=f"extend_user_{user_id}_hours_3"),
+                   types.InlineKeyboardButton("🕒 +6 часов", callback_data=f"extend_user_{user_id}_hours_6"))
+        markup.row(types.InlineKeyboardButton("🕓 +12 часов", callback_data=f"extend_user_{user_id}_hours_12"),
+                   types.InlineKeyboardButton("🕔 +24 часа", callback_data=f"extend_user_{user_id}_hours_24"))
+
+        # Дни
+        markup.row(types.InlineKeyboardButton("📅 +1 день", callback_data=f"extend_user_{user_id}_days_1"),
+                   types.InlineKeyboardButton("📅 +3 дня", callback_data=f"extend_user_{user_id}_days_3"),
+                   types.InlineKeyboardButton("📅 +7 дней", callback_data=f"extend_user_{user_id}_days_7"))
+        markup.row(types.InlineKeyboardButton("📅 +14 дней", callback_data=f"extend_user_{user_id}_days_14"),
+                   types.InlineKeyboardButton("📅 +30 дней", callback_data=f"extend_user_{user_id}_days_30"),
+                   types.InlineKeyboardButton("📅 +60 дней", callback_data=f"extend_user_{user_id}_days_60"))
+
+        markup.row(types.InlineKeyboardButton("↩️ Назад", callback_data="admin_extend_sub"))
+
+        user_info_text = f"👤 <b>Информация о пользователе</b>\n\n"
+        user_info_text += f"🆔 ID: {user_id}\n"
+        user_info_text += f"👤 Имя: {first_name}\n"
+        user_info_text += f"📱 Username: @{username}\n"
+        user_info_text += f"💳 Подписка: {has_sub}\n"
+        if end_date != 'нет подписки':
+            user_info_text += f"📅 Действует до: {end_date}\n"
+        user_info_text += f"\nВыберите срок продления:"
+
+        bot.send_message(
+            chat_id,
+            user_info_text,
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+
+        del user_extend_states[chat_id]
+
+    except ValueError:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔄 Попробовать снова", callback_data="extend_user_menu"),
+                   types.InlineKeyboardButton("↩️ Назад", callback_data="admin_extend_sub"))
+
+        bot.send_message(
+            chat_id,
+            "❌ <b>Неверный формат ID</b>\n\n"
+            "ID пользователя должен быть числом. Попробуйте снова.",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        del user_extend_states[chat_id]
+    except Exception as e:
+        logger.error(f"Ошибка в handle_extend_user_id: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {e}")
+        if chat_id in user_extend_states:
+            del user_extend_states[chat_id]
+
+
+def handle_extend_user_callback(call):
+    """Обработка выбора срока продления для конкретного пользователя"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    try:
+        # Парсим данные из callback (формат: extend_user_[user_id]_[тип]_[значение])
+        parts = call.data.split('_')
+
+        if len(parts) < 5:
+            bot.answer_callback_query(call.id, "❌ Неверный формат команды")
+            return
+
+        user_id = int(parts[2])  # ID пользователя
+        time_type = parts[3]  # hours или days
+        value = int(parts[4])  # значение
+
+        # Устанавливаем часы и дни
+        hours = value if time_type == 'hours' else 0
+        days = value if time_type == 'days' else 0
+
+        # Получаем информацию о пользователе
+        user_info = db.get_user(user_id)
+        if not user_info:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден")
+            return
+
+        username = user_info.get('username', 'нет username')
+        first_name = user_info.get('first_name', 'неизвестно')
+
+        # Создаем подтверждающее сообщение
+        time_text = ""
+        if hours > 0:
+            time_text = f"{hours} час(ов)"
+        elif days > 0:
+            time_text = f"{days} день(ей)"
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton(f"✅ Да, продлить на {time_text}",
+                                       callback_data=f"confirm_extend_user_{user_id}_{hours}_{days}"),
+            types.InlineKeyboardButton("❌ Нет, отмена", callback_data="admin_extend_sub")
+        )
+
+        confirmation_text = f"⚠️ <b>Подтверждение продления</b>\n\n"
+        confirmation_text += f"👤 Пользователь: {first_name} (@{username})\n"
+        confirmation_text += f"🆔 ID: {user_id}\n"
+        confirmation_text += f"⏱️ Срок: {time_text}\n\n"
+        confirmation_text += f"Вы уверены, что хотите продлить подписку этому пользователю?"
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=confirmation_text,
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id)
+
+    except Exception as e:
+        logger.error(f"Ошибка в handle_extend_user_callback: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка обработки запроса")
+
+@bot.message_handler(commands=['send_all_users'])
+def handle_send_all_users(call):
+    """Запуск массовой рассылки сообщений всем пользователям через callback"""
+    chat_id = call.message.chat.id  # Исправлено: получаем chat_id из call.message.chat
+    message_id = call.message.message_id
+    user = db.get_user(chat_id)
+
+    if not user or not user.get('is_admin'):
+        bot.answer_callback_query(call.id, "❌ У вас нет прав администратора для этой команды.")
+        return
+
+    # Сохраняем состояние пользователя
+    user_broadcast_states[chat_id] = {
+        'state': 'waiting_for_message',
+        'message': None,
+        'confirmed': False
+    }
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_broadcast"))
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text="📢 <b>МАССОВАЯ РАССЫЛКА</b>\n\n"
+             "Отправьте сообщение, которое хотите разослать всем пользователям бота.\n"
+             "Можно использовать HTML-разметку.\n\n"
+             "<i>Или нажмите кнопку Отмена для выхода</i>",
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+
+@bot.message_handler(func=lambda message: message.chat.id in user_broadcast_states and
+                                          user_broadcast_states[message.chat.id]['state'] == 'waiting_for_message')
+def handle_broadcast_message(message):
+    """Обработка сообщения для рассылки"""
+    chat_id = message.chat.id
+    user_state = user_broadcast_states[chat_id]
+
+    # Сохраняем сообщение
+    user_state['state'] = 'waiting_for_confirmation'
+    user_state['message'] = message.text or message.caption
+    user_state['message_type'] = message.content_type
+    user_state['message_id'] = message.message_id
+
+    # Если есть фото/документ/другие медиафайлы
+    if message.photo:
+        user_state['photo'] = message.photo[-1].file_id
+    if message.document:
+        user_state['document'] = message.document.file_id
+    if message.video:
+        user_state['video'] = message.video.file_id
+    if message.audio:
+        user_state['audio'] = message.audio.file_id
+
+    # Получаем информацию о пользователях
+    all_users = db.get_all_users()
+    active_users = [u for u in all_users if db.check_subscription(u['telegram_id'])]
+    total_users = len(all_users)
+
+    # Предпросмотр сообщения
+    preview_text = "📢 <b>ПРЕДПРОСМОТР РАССЫЛКИ</b>\n\n"
+    preview_text += f"📝 <b>Сообщение:</b>\n{user_state['message'][:200]}"
+    if len(user_state['message']) > 200:
+        preview_text += "..."
+
+    preview_text += f"\n\n📊 <b>Статистика:</b>\n"
+    preview_text += f"👥 Всего пользователей: {total_users}\n"
+    preview_text += f"✅ Активных подписок: {len(active_users)}\n\n"
+    preview_text += "⚠️ <b>Внимание:</b> Это сообщение будет отправлено ВСЕМ пользователям бота."
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Да, отправить всем", callback_data="confirm_broadcast"),
+        types.InlineKeyboardButton("✏️ Редактировать", callback_data="edit_broadcast")
+    )
+    markup.add(
+        types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_broadcast"),
+        types.InlineKeyboardButton("📊 Только активным", callback_data="broadcast_active_only")
+    )
+
+    # Отправляем предпросмотр
+    try:
+        # Если есть фото
+        if 'photo' in user_state:
+            bot.send_photo(
+                chat_id,
+                photo=user_state['photo'],
+                caption=preview_text,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        elif 'document' in user_state:
+            bot.send_document(
+                chat_id,
+                document=user_state['document'],
+                caption=preview_text,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        elif 'video' in user_state:
+            bot.send_video(
+                chat_id,
+                video=user_state['video'],
+                caption=preview_text,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        elif 'audio' in user_state:
+            bot.send_audio(
+                chat_id,
+                audio=user_state['audio'],
+                caption=preview_text,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                preview_text,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+    except Exception as e:
+        bot.send_message(
+            chat_id,
+            f"❌ Ошибка при создании предпросмотра: {e}\n\nПопробуйте отправить сообщение еще раз.",
+            parse_mode='HTML'
+        )
+        user_broadcast_states[chat_id]['state'] = 'waiting_for_message'
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ['confirm_broadcast', 'edit_broadcast',
+                                                            'cancel_broadcast', 'broadcast_active_only'])
+def handle_broadcast_callback(call):
+    """Обработка callback для массовой рассылки"""
+    chat_id = call.message.chat.id
+
+    if chat_id not in user_broadcast_states:
+        bot.answer_callback_query(call.id, "❌ Сессия рассылки устарела")
+        return
+
+    user_state = user_broadcast_states[chat_id]
+
+    if call.data == 'confirm_broadcast':
+        # Подтверждение отправки всем пользователям
+        bot.answer_callback_query(call.id, "🚀 Начинаю рассылку...")
+        send_broadcast_to_all(chat_id, user_state, call.message.message_id, active_only=False)
+
+    elif call.data == 'broadcast_active_only':
+        # Отправка только активным пользователям
+        bot.answer_callback_query(call.id, "🚀 Начинаю рассылку активным пользователям...")
+        send_broadcast_to_all(chat_id, user_state, call.message.message_id, active_only=True)
+
+    elif call.data == 'edit_broadcast':
+        # Редактирование сообщения
+        bot.answer_callback_query(call.id, "✏️ Отправьте новое сообщение")
+        user_broadcast_states[chat_id]['state'] = 'waiting_for_message'
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_broadcast"))
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="📢 <b>МАССОВАЯ РАССЫЛКА</b>\n\n"
+                 "Отправьте новое сообщение для рассылки.\n"
+                 "Можно использовать HTML-разметку.\n\n"
+                 "<i>Или нажмите кнопку Отмена для выхода</i>",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+
+    elif call.data == 'cancel_broadcast':
+        # Отмена рассылки
+        bot.answer_callback_query(call.id, "❌ Рассылка отменена")
+        if chat_id in user_broadcast_states:
+            del user_broadcast_states[chat_id]
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="❌ <b>Рассылка отменена</b>",
+            parse_mode='HTML'
+        )
+
+
+def send_broadcast_to_all(admin_chat_id, broadcast_data, message_id, active_only=False):
+    """Отправка рассылки всем пользователям"""
+    try:
+        # Получаем всех пользователей
+        all_users = db.get_all_users()
+
+        if active_only:
+            users_to_send = [u for u in all_users if db.check_subscription(u['telegram_id'])]
+            filter_text = "только активным пользователям"
+        else:
+            users_to_send = all_users
+            filter_text = "всем пользователям"
+
+        total_users = len(users_to_send)
+        success_count = 0
+        failed_count = 0
+        failed_users = []
+
+        # Отправляем статус
+        status_message = bot.send_message(
+            admin_chat_id,
+            f"📤 <b>Начинаю рассылку {filter_text}</b>\n\n"
+            f"👥 Всего получателей: {total_users}\n"
+            f"✅ Успешно отправлено: 0/{total_users}\n"
+            f"❌ Ошибок: 0\n"
+            f"⏳ Ожидание: {total_users}",
+            parse_mode='HTML'
+        )
+
+        # Отправляем сообщение каждому пользователю
+        for i, user in enumerate(users_to_send, 1):
+            try:
+                user_id = user['telegram_id']
+
+                # Пропускаем администратора, который отправляет рассылку
+                if user_id == admin_chat_id:
+                    success_count += 1
+                    continue
+
+                # Отправляем сообщение в зависимости от типа
+                if 'photo' in broadcast_data:
+                    bot.send_photo(
+                        user_id,
+                        photo=broadcast_data['photo'],
+                        caption=broadcast_data['message'],
+                        parse_mode='HTML'
+                    )
+                elif 'document' in broadcast_data:
+                    bot.send_document(
+                        user_id,
+                        document=broadcast_data['document'],
+                        caption=broadcast_data['message'],
+                        parse_mode='HTML'
+                    )
+                elif 'video' in broadcast_data:
+                    bot.send_video(
+                        user_id,
+                        video=broadcast_data['video'],
+                        caption=broadcast_data['message'],
+                        parse_mode='HTML'
+                    )
+                elif 'audio' in broadcast_data:
+                    bot.send_audio(
+                        user_id,
+                        audio=broadcast_data['audio'],
+                        caption=broadcast_data['message'],
+                        parse_mode='HTML'
+                    )
+                else:
+                    bot.send_message(
+                        user_id,
+                        broadcast_data['message'],
+                        parse_mode='HTML'
+                    )
+
+                success_count += 1
+
+                # Обновляем активность пользователя
+                db.update_activity(user_id)
+
+            except Exception as e:
+                failed_count += 1
+                failed_users.append(f"{user_id} ({user.get('username', 'нет username')})")
+                logger.error(f"Ошибка при отправке рассылки пользователю {user_id}: {e}")
+
+            # Обновляем статус каждые 10 сообщений или в конце
+            if i % 10 == 0 or i == total_users:
+                try:
+                    bot.edit_message_text(
+                        chat_id=admin_chat_id,
+                        message_id=status_message.message_id,
+                        text=f"📤 <b>Рассылка в процессе...</b>\n\n"
+                             f"👥 Всего получателей: {total_users}\n"
+                             f"✅ Успешно отправлено: {success_count}/{total_users}\n"
+                             f"❌ Ошибок: {failed_count}\n"
+                             f"⏳ Ожидание: {total_users - i}",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+
+            # Небольшая задержка, чтобы не превысить лимиты Telegram
+            time.sleep(0.1)
+
+        # Логируем результат
+        logger.info(
+            f"Администратор {admin_chat_id} отправил рассылку. Успешно: {success_count}, Ошибок: {failed_count}")
+
+        # Формируем итоговый отчет
+        report_text = f"📊 <b>ИТОГ РАССЫЛКИ</b>\n\n"
+        report_text += f"✅ <b>Успешно отправлено:</b> {success_count}/{total_users}\n"
+        report_text += f"❌ <b>Ошибок:</b> {failed_count}\n"
+
+        if active_only:
+            report_text += f"🎯 <b>Фильтр:</b> Только активные пользователи\n"
+        else:
+            report_text += f"🎯 <b>Фильтр:</b> Все пользователи\n"
+
+        if failed_count > 0 and len(failed_users) > 0:
+            report_text += f"\n📝 <b>Список ошибок (первые 10):</b>\n"
+            for failed in failed_users[:10]:
+                report_text += f"• {failed}\n"
+
+            if len(failed_users) > 10:
+                report_text += f"... и еще {len(failed_users) - 10} пользователей\n"
+
+        # Отправляем итоговый отчет
+        bot.edit_message_text(
+            chat_id=admin_chat_id,
+            message_id=status_message.message_id,
+            text=report_text,
+            parse_mode='HTML'
+        )
+
+        # Очищаем состояние
+        if admin_chat_id in user_broadcast_states:
+            del user_broadcast_states[admin_chat_id]
+
+        # Отправляем уведомление в лог-чат
+        log_text = f"📢 Администратор {admin_chat_id} провел рассылку\n"
+        log_text += f"✅ Успешно: {success_count}, ❌ Ошибок: {failed_count}"
+        logger.info(log_text)
+
+    except Exception as e:
+        logger.error(f"Ошибка при массовой рассылке: {e}")
+        bot.send_message(
+            admin_chat_id,
+            f"❌ <b>Критическая ошибка при рассылке:</b>\n{e}",
+            parse_mode='HTML'
+        )
+
+        # Очищаем состояние
+        if admin_chat_id in user_broadcast_states:
+            del user_broadcast_states[admin_chat_id]
 
 def select_topic_callback(call):
     """Обработчик выбора темы"""
@@ -2671,7 +3941,7 @@ def logs_last_100_callback(call):
 
     try:
         # Читаем логи из файла
-        log_file = 'bot.log'
+        log_file = 'data/bot.log'
         if os.path.exists(log_file):
             with open(log_file, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
@@ -2708,7 +3978,7 @@ def logs_stats_callback(call):
     message_id = call.message.message_id
 
     try:
-        log_file = 'bot.log'
+        log_file = 'data/bot.log'
         if os.path.exists(log_file):
             with open(log_file, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -2754,7 +4024,7 @@ def logs_get_file_callback(call):
     message_id = call.message.message_id
 
     try:
-        log_file = 'bot.log'
+        log_file = 'data/bot.log'
         if os.path.exists(log_file):
             with open(log_file, 'rb') as f:
                 bot.send_document(chat_id, f, caption="📁 Файл логов")
@@ -2788,7 +4058,7 @@ def logs_clear_confirm_callback(call):
     message_id = call.message.message_id
 
     try:
-        log_file = 'bot.log'
+        log_file = 'data/bot.log'
         if os.path.exists(log_file):
             # Создаем резервную копию
             backup_file = f'bot.log.backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
@@ -2923,16 +4193,24 @@ def handle_callback_query(call):
         elif call.data == "subscription_terms":
             subscription_terms_callback(call)
         elif call.data == "pay_now":
-            # pay_now_callback(call)
-            bot.answer_callback_query(call.id, "⏸️ Оплата временно недоступна")
-            return
+            pay_now_callback(call)
         elif call.data.startswith('check_payment_'):
             check_payment_callback(call)
         elif call.data == "payment_instructions":
             payment_instructions_callback(call)
-        # Добавляем обработку админских callback-ов
-        elif any(call.data.startswith(prefix) for prefix in ['admin_', 'logs_', 'restart_', 'back_to_admin']):
+        # Админские callback-ы
+        elif any(call.data.startswith(prefix) for prefix in ['admin_', 'logs_', 'restart_', 'back_to_admin',
+                                                              'confirm_extend_']):
             handle_admin_callback(call)
+        # Обработчики продления подписки (отдельно)
+        elif call.data == "extend_user_menu":
+            extend_user_menu_callback(call)
+        elif call.data == "extend_all_menu":
+            extend_all_menu_callback(call)
+        elif call.data.startswith('extend_user_') and not call.data.startswith('extend_user_menu'):
+            handle_extend_user_callback(call)
+        elif call.data.startswith('extend_all_') and not call.data.startswith('extend_all_menu'):
+            handle_extend_all_callback(call)
         else:
             bot.answer_callback_query(call.id, "❌ Неизвестная команда")
 
@@ -3100,8 +4378,7 @@ def check_and_update_subscriptions():
 
 def shutdown_handler(signum=None, frame=None):
     """Обработчик завершения работы"""
-    print("\n⚠️ Получен сигнал завершения работы...")
-
+    logger.info("⚠️ Получен сигнал завершения работы...")
     try:
         # Проверяем состояние планировщика более надежно
         if scheduler:
@@ -3213,9 +4490,6 @@ def setup_admin_from_env():
 
 def run_startup_tasks():
     """Задачи, выполняемые один раз при запуске бота"""
-    print("=" * 50)
-    print("🚀 Выполнение стартовых задач...")
-    print("=" * 50)
 
     # Назначение администраторов из переменных окружения
     if setup_admin_from_env():
@@ -3223,24 +4497,26 @@ def run_startup_tasks():
     else:
         print("⚠️ Назначение администраторов не выполнено")
 
-    # Здесь можно добавить другие стартовые задачи
-    # Например, проверку структуры базы данных, создание необходимых таблиц и т.д.
-
-    print("=" * 50)
-    print("✅ Стартовые задачи выполнены")
-    print("=" * 50)
+    if setup_bot_commands():
+        print("✅ Меню команд бота настроено")
+    else:
+        print("⚠️ Не удалось настроить меню команд бота")
 
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🚀 Запуск бота...")
-    print("=" * 50)
+    logger.info("=" * 50)
+    logger.info("🚀 Запуск бота...")
+    logger.info("=" * 50)
 
     # Выполняем стартовые задачи
     run_startup_tasks()
-    # Загружаем вопросы
+
+    # Логирование загрузки вопросов
+    logger.info("📂 Загрузка вопросов...")
     check_and_load_questions()
 
+    # Логирование запуска планировщика
+    logger.info("⏰ Настройка планировщика...")
     # Запускаем планировщик
     setup_scheduler()
 
@@ -3249,8 +4525,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown_handler)
     atexit.register(shutdown_handler)
 
-    print("\n✅ Все системы запущены. Ожидание сообщений...")
-    print("=" * 50)
+    logger.info("✅ Все системы запущены. Ожидание сообщений...")
+    logger.info("=" * 50)
 
     # Запускаем бота
     try:
