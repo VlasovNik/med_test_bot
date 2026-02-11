@@ -5,3 +5,5 @@ pytz==2024.1
 yookassa==2.4.0
 requests==2.31.0
 pyyaml==6.0.1
+psutil==5.9.8
+typing-extensions==4.9.0
