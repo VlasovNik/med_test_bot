@@ -29,7 +29,6 @@ from yookassa.domain.notification import WebhookNotificationEventType, WebhookNo
 import uuid
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
-import psutil  # для мониторинга памяти
 from threading import Lock  # для потокобезопасности
 
 # Загрузка переменных окружения
@@ -4319,8 +4318,8 @@ def check_payment_callback(call):
         payment = None
         try:
             # Пробуем получить статус платежа с таймаутом
-            payment = Payment.find_one(payment_id, timeout=10)  # Таймаут 10 секунд
-        except yookassa.exceptions.ApiError as api_error:
+            payment = Payment.find_one(payment_id)  # Таймаут 10 секунд
+        except yookassa.errors.ApiError as api_error:
             logger.error(f"❌ Ошибка API ЮKassa: {api_error}")
             # Показываем пользователю сообщение об ошибке API
             markup = types.InlineKeyboardMarkup()
