@@ -6,6 +6,8 @@ from telebot import types
 import sqlite3
 import atexit
 import signal
+import pytz
+from datetime import datetime
 import sys
 import time
 import requests
@@ -622,26 +624,23 @@ class Database:
             if not end_date_str:
                 return False
 
-            # Преобразуем строку в datetime с учетом временной зоны
+            # ВСЕГДА ХРАНИМ В UTC И РАБОТАЕМ С UTC
             try:
-                # Пробуем парсить с временем
+                # Парсим как naive
                 end_naive = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
             except ValueError:
                 try:
-                    # Пробуем парсить только дату
                     end_naive = datetime.strptime(end_date_str, '%Y-%m-%d')
+                    # Добавляем время 23:59:59 для совместимости
+                    end_naive = end_naive.replace(hour=23, minute=59, second=59)
                 except ValueError:
                     return False
 
-            # Добавляем временную зону (предполагаем UTC)
-            try:
-                import pytz
-                end_utc = pytz.UTC.localize(end_naive)
-                now_utc = datetime.now(pytz.UTC)
-                return end_utc > now_utc
-            except ImportError:
-                # Если pytz не установлен, используем naive datetime
-                return end_naive > datetime.now()
+            # Предполагаем, что в БД время в UTC, и делаем его aware
+            end_aware = pytz.UTC.localize(end_naive)
+            now_aware = datetime.now(pytz.UTC)
+
+            return end_aware > now_aware
 
         except Exception as e:
             logger.error(f"❌ Ошибка при проверке подписки: {e}")
@@ -649,7 +648,7 @@ class Database:
 
     def update_subscription(self, telegram_id: int, paid_status=True, end_datetime=None,
                             is_trial=False, is_purchased=False, conn=None) -> bool:
-        """Обновление подписки с инвалидацией кеша"""
+        """Обновление подписки - ВСЕ ДАТЫ В UTC"""
         close_conn = False
         if conn is None:
             conn = self.get_connection()
@@ -659,8 +658,20 @@ class Database:
             cursor = conn.cursor()
 
             if end_datetime:
+                # УБЕЖДАЕМСЯ, ЧТО ДАТА В UTC
+                if hasattr(end_datetime, 'tzinfo') and end_datetime.tzinfo is not None:
+                    # Конвертируем в UTC если нужно
+                    end_datetime = end_datetime.astimezone(pytz.UTC)
+                else:
+                    # Если naive - считаем что это UTC
+                    end_datetime = pytz.UTC.localize(end_datetime)
+
+                # ХРАНИМ В БД БЕЗ ЧАСОВОГО ПОЯСА (naive), но В UTC
                 end_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                # Текущее время в UTC
+                now_aware = datetime.now(pytz.UTC)
+                start_str = now_aware.strftime('%Y-%m-%d %H:%M:%S')
 
                 cursor.execute('''
                 UPDATE users 
@@ -672,16 +683,6 @@ class Database:
                     last_activity = CURRENT_TIMESTAMP
                 WHERE telegram_id = ?
                 ''', (paid_status, start_str, end_str, is_trial, is_purchased, telegram_id))
-
-            else:
-                cursor.execute('''
-                UPDATE users 
-                SET subscription_paid = ?,
-                    is_trial_used = ?,
-                    subscription_purchased = ?,
-                    last_activity = CURRENT_TIMESTAMP
-                WHERE telegram_id = ?
-                ''', (paid_status, is_trial, is_purchased, telegram_id))
 
             if close_conn:
                 conn.commit()
@@ -763,7 +764,7 @@ class Database:
                 'telegram_id': telegram_id,
                 'total_answers': 0,
                 'correct_answers': 0,
-                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'last_updated': datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')
             }
 
         except sqlite3.Error as e:
@@ -1022,8 +1023,8 @@ class Database:
             conn = self.get_connection()
             cursor = conn.cursor()
 
-            start_datetime = datetime.now()
-            end_datetime = datetime.now() + timedelta(days=days)
+            start_datetime = datetime.now(pytz.UTC)
+            end_datetime = datetime.now(pytz.UTC) + timedelta(days=days)
 
             start_str = start_datetime.strftime('%Y-%m-%d %H:%M:%S')
             end_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
@@ -1047,7 +1048,7 @@ class Database:
             return False
 
     def extend_subscription(self, telegram_id: int, hours: int = 0, days: int = 0) -> bool:
-        """Продление подписки пользователю на указанное время"""
+        """Продление подписки пользователю - ИСПРАВЛЕНО: ВСЕ В UTC"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -1060,27 +1061,38 @@ class Database:
             ''', (telegram_id,))
 
             result = cursor.fetchone()
-
             if not result:
                 conn.close()
                 return False
 
             current_end_date_str, subscription_paid = result
 
+            # Текущее время в UTC
+            now_utc = datetime.now(pytz.UTC)
+
             # Определяем новую дату окончания
             if current_end_date_str and subscription_paid:
                 try:
-                    # Если есть активная подписка, продлеваем от текущей даты окончания
-                    current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
-                    new_end = current_end + timedelta(days=days, hours=hours)
+                    # Парсим naive дату из БД
+                    current_end_naive = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
+                    # Делаем aware (UTC)
+                    current_end_aware = pytz.UTC.localize(current_end_naive)
+
+                    # Если подписка активна - продлеваем от текущей даты окончания
+                    if current_end_aware > now_utc:
+                        new_end_aware = current_end_aware + timedelta(days=days, hours=hours)
+                    else:
+                        # Если истекла - от текущего момента
+                        new_end_aware = now_utc + timedelta(days=days, hours=hours)
                 except ValueError:
                     # Если формат неверный, продлеваем от текущего момента
-                    new_end = datetime.now() + timedelta(days=days, hours=hours)
+                    new_end_aware = now_utc + timedelta(days=days, hours=hours)
             else:
                 # Если подписки нет, начинаем с текущего момента
-                new_end = datetime.now() + timedelta(days=days, hours=hours)
+                new_end_aware = now_utc + timedelta(days=days, hours=hours)
 
-            new_end_str = new_end.strftime('%Y-%m-%d %H:%M:%S')
+            # Сохраняем в БД как naive строку (но время в UTC)
+            new_end_str = new_end_aware.strftime('%Y-%m-%d %H:%M:%S')
 
             # Обновляем дату окончания
             cursor.execute('''
@@ -1094,18 +1106,23 @@ class Database:
             conn.commit()
             conn.close()
 
-            # Логируем продление
-            logger.info(f"Подписка пользователя {telegram_id} продлена до {new_end_str} (+{days} дней, +{hours} часов)")
+            logger.info(
+                f"✅ Подписка пользователя {telegram_id} продлена до {new_end_str} (+{days} дней, +{hours} часов)")
             return True
 
         except Exception as e:
-            logger.error(f"Ошибка при продлении подписки для {telegram_id}: {e}")
+            logger.error(f"❌ Ошибка при продлении подписки для {telegram_id}: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     def extend_all_active_subscriptions(self, hours: int = 0, days: int = 0) -> dict:
-        """Продление подписки всем пользователям с безопасными запросами"""
+        """Продление подписки всем пользователям - ИСПРАВЛЕНО: ВСЕ В UTC"""
         try:
             logger.info(f"🔄 Начинаю массовое продление подписок: +{days} дней, +{hours} часов")
+
+            # ВСЕГДА ИСПОЛЬЗУЕМ UTC ДЛЯ СРАВНЕНИЯ
+            now_utc = datetime.now(pytz.UTC)
+            logger.info(f"📅 Текущее время UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
 
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -1121,10 +1138,6 @@ class Database:
             users = cursor.fetchall()
             logger.info(f"📊 Найдено пользователей для продления: {len(users)}")
 
-            # Логируем первых 5 пользователей для отладки
-            for i, user in enumerate(users[:5]):
-                logger.info(f"   Пользователь {i + 1}: ID={user[0]}, дата окончания={user[1]}")
-
             results = {
                 'total': len(users),
                 'success': 0,
@@ -1139,38 +1152,36 @@ class Database:
 
                     logger.info(f"🔄 Обработка пользователя {telegram_id}, текущая дата: {current_end_date_str}")
 
-                    # Определяем новую дату окончания
-                    if current_end_date_str:
+                    # Парсим дату из БД (она ВСЕГДА naive, но мы ЗНАЕМ что это UTC)
+                    try:
+                        current_end_naive = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
                         try:
-                            # Пытаемся парсить дату
-                            current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
-                            logger.info(f"   Парсинг успешен: {current_end}")
-                        except ValueError:
-                            try:
-                                current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d')
-                                logger.info(f"   Парсинг только даты: {current_end}")
-                            except ValueError as e:
-                                logger.error(f"   Ошибка парсинга даты: {e}")
-                                # Если формат неизвестен, используем текущую дату
-                                current_end = datetime.now()
-                                logger.info(f"   Использую текущую дату: {current_end}")
+                            current_end_naive = datetime.strptime(current_end_date_str, '%Y-%m-%d')
+                            current_end_naive = current_end_naive.replace(hour=23, minute=59, second=59)
+                        except ValueError as e:
+                            logger.error(f"   ❌ Ошибка парсинга даты: {e}")
+                            results['failed'] += 1
+                            results['errors'].append(f"{telegram_id}: неверный формат даты")
+                            continue
 
-                        # Проверяем, не истекла ли подписка
-                        if current_end > datetime.now():
-                            # Подписка активна - продлеваем от текущей даты окончания
-                            new_end = current_end + timedelta(days=days, hours=hours)
-                            logger.info(f"   Подписка активна, новая дата: {new_end}")
-                        else:
-                            # Подписка истекла - начинаем с текущего момента
-                            new_end = datetime.now() + timedelta(days=days, hours=hours)
-                            logger.info(f"   Подписка истекла, новая дата: {new_end}")
+                    # ДЕЛАЕМ naive -> aware (UTC) ДЛЯ СРАВНЕНИЯ
+                    current_end_aware = pytz.UTC.localize(current_end_naive)
 
+                    # ТЕПЕРЬ СРАВНИВАЕМ aware С aware
+                    if current_end_aware > now_utc:
+                        # Подписка активна - продлеваем от текущей даты окончания
+                        new_end_aware = current_end_aware + timedelta(days=days, hours=hours)
+                        logger.info(
+                            f"   ✅ Подписка активна, новая дата (UTC): {new_end_aware.strftime('%Y-%m-%d %H:%M:%S')}")
                     else:
-                        # Если даты нет, начинаем с текущего момента
-                        new_end = datetime.now() + timedelta(days=days, hours=hours)
-                        logger.info(f"   Нет даты, новая дата: {new_end}")
+                        # Подписка истекла - начинаем с текущего момента
+                        new_end_aware = now_utc + timedelta(days=days, hours=hours)
+                        logger.info(
+                            f"   ⚠️ Подписка истекла, новая дата (UTC): {new_end_aware.strftime('%Y-%m-%d %H:%M:%S')}")
 
-                    new_end_str = new_end.strftime('%Y-%m-%d %H:%M:%S')
+                    # СОХРАНЯЕМ В БД КАК naive (без часового пояса), но в UTC
+                    new_end_str = new_end_aware.strftime('%Y-%m-%d %H:%M:%S')
 
                     # Обновляем дату окончания
                     cursor.execute('''
@@ -1180,12 +1191,33 @@ class Database:
                     WHERE telegram_id = ?
                     ''', (new_end_str, telegram_id))
 
-                    # Проверяем, что обновление произошло
                     if cursor.rowcount > 0:
-                        logger.info(f"✅ Успешно обновлено {cursor.rowcount} строк для пользователя {telegram_id}")
+                        logger.info(f"   ✅ Успешно обновлено для пользователя {telegram_id}")
                         results['success'] += 1
+
+                        # Отправляем уведомление пользователю
+                        try:
+                            # Конвертируем UTC в локальное время для уведомления
+                            local_tz = pytz_timezone('Asia/Novosibirsk')
+                            new_end_local = new_end_aware.astimezone(local_tz)
+                            end_str_local = new_end_local.strftime('%d.%m.%Y в %H:%M')
+
+                            notification = f"🎉 <b>Ваша подписка продлена!</b>\n\n"
+                            if days > 0 and hours > 0:
+                                notification += f"⏱️ Срок: +{days} дн. {hours} ч.\n"
+                            elif days > 0:
+                                notification += f"⏱️ Срок: +{days} дн.\n"
+                            elif hours > 0:
+                                notification += f"⏱️ Срок: +{hours} ч.\n"
+                            notification += f"📅 Действует до: {end_str_local}"
+
+                            bot.send_message(telegram_id, notification, parse_mode='HTML')
+                            logger.info(f"   ✅ Уведомление отправлено пользователю {telegram_id}")
+                        except Exception as e:
+                            logger.warning(f"   ⚠️ Не удалось отправить уведомление {telegram_id}: {e}")
+
                     else:
-                        logger.error(f"❌ Нет обновленных строк для пользователя {telegram_id}")
+                        logger.error(f"   ❌ Нет обновленных строк для пользователя {telegram_id}")
                         results['failed'] += 1
                         results['errors'].append(f"{telegram_id}: нет обновленных строк")
 
@@ -1196,19 +1228,8 @@ class Database:
                     logger.error(f"❌ Ошибка при продлении подписки пользователя {telegram_id}: {e}")
                     logger.error(traceback.format_exc())
 
-            # Применяем изменения
             conn.commit()
             logger.info(f"💾 Изменения сохранены в БД")
-
-            # Проверяем, что изменения применились
-            cursor.execute('''
-            SELECT COUNT(*) FROM users 
-            WHERE subscription_paid = TRUE 
-            AND subscription_end_date IS NOT NULL
-            ''')
-            updated_count = cursor.fetchone()[0]
-            logger.info(f"📊 После обновления: {updated_count} пользователей с активными подписками")
-
             conn.close()
 
             logger.info(f"✅ Массовое продление завершено: успешно {results['success']}, ошибок {results['failed']}")
@@ -1597,7 +1618,7 @@ def send_message_async(chat_id, text, parse_mode=None, reply_markup=None):
     thread.start()
 
 def sync_paid_subscriptions_on_startup():
-    """Синхронизация оплаченных подписок"""
+    """Синхронизация оплаченных подписок - ВСЕ В UTC"""
     logger.info("🔄 Запуск синхронизации оплаченных подписок...")
 
     try:
@@ -1605,8 +1626,11 @@ def sync_paid_subscriptions_on_startup():
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        MAX_DAYS_FOR_PAYMENT_CHECK = 3  # Добавляем константу
+        MAX_DAYS_FOR_PAYMENT_CHECK = 3
         ACTIVATION_WINDOW_HOURS = 24
+
+        # Текущее время в UTC
+        now_utc = datetime.now(pytz.UTC)
 
         cursor.execute(f'''
             SELECT 
@@ -1630,7 +1654,7 @@ def sync_paid_subscriptions_on_startup():
                 (p.paid_at IS NULL AND p.created_at >= datetime('now', '-{MAX_DAYS_FOR_PAYMENT_CHECK} days'))
             )
             ORDER BY p.paid_at ASC, p.created_at ASC
-            ''')
+        ''')
 
         payments = cursor.fetchall()
 
@@ -1665,25 +1689,30 @@ def sync_paid_subscriptions_on_startup():
                 payment_datetime = None
                 if paid_at:
                     try:
-                        payment_datetime = datetime.strptime(paid_at, '%Y-%m-%d %H:%M:%S')
+                        payment_naive = datetime.strptime(paid_at, '%Y-%m-%d %H:%M:%S')
+                        payment_datetime = pytz.UTC.localize(payment_naive)
                     except:
                         pass
 
                 if not payment_datetime:
-                    # Пропускаем если не удалось определить дату
-                    cursor.execute('UPDATE payments SET is_processed = TRUE WHERE payment_id = ?', (payment_id,))
-                    skipped_count += 1
                     continue
 
                 # Проверяем текущую подписку
                 subscription_end_date = payment['subscription_end_date']
                 subscription_end_datetime = None
+                if subscription_end_date:
+                    try:
+                        end_naive = datetime.strptime(subscription_end_date, '%Y-%m-%d %H:%M:%S')
+                        subscription_end_datetime = pytz.UTC.localize(end_naive)
+                    except:
+                        pass
                 user_has_active_subscription = False
-
+                if subscription_end_datetime:
+                    user_has_active_subscription = subscription_end_datetime > now_utc
                 if (payment['subscription_paid'] == 1 and subscription_end_date):
                     try:
                         subscription_end_datetime = datetime.strptime(subscription_end_date, '%Y-%m-%d %H:%M:%S')
-                        user_has_active_subscription = subscription_end_datetime > datetime.now()
+                        user_has_active_subscription = subscription_end_datetime > datetime.now(pytz.UTC)
                     except:
                         pass
 
@@ -1698,41 +1727,46 @@ def sync_paid_subscriptions_on_startup():
                     should_activate = True
                 elif user_has_active_subscription and user_has_purchased_subscription:
                     if subscription_end_datetime:
-                        hours_until_expiry = (subscription_end_datetime - datetime.now()).total_seconds() / 3600
+                        hours_until_expiry = (subscription_end_datetime - datetime.now(pytz.UTC)).total_seconds() / 3600
                         if hours_until_expiry <= ACTIVATION_WINDOW_HOURS:
                             should_activate = True
 
                 if should_activate:
                     # Определяем дату окончания
                     if user_has_active_subscription and subscription_end_datetime:
-                        if subscription_end_datetime > datetime.now():
+                        if subscription_end_datetime > datetime.now(pytz.UTC):
                             end_datetime = subscription_end_datetime + timedelta(days=30)
                         else:
-                            end_datetime = datetime.now() + timedelta(days=30)
+                            end_datetime = datetime.now(pytz.UTC) + timedelta(days=30)
                     else:
                         end_datetime = payment_datetime + timedelta(days=30)
 
                     # Корректируем если платеж был давно
-                    hours_since_payment = (datetime.now() - payment_datetime).total_seconds() / 3600
+                    hours_since_payment = (datetime.now(pytz.UTC) - payment_datetime).total_seconds() / 3600
                     if hours_since_payment > 24:
-                        end_datetime = datetime.now() + timedelta(days=30)
+                        end_datetime = datetime.now(pytz.UTC) + timedelta(days=30)
 
                     # ОБНОВЛЯЕМ ПОДПИСКУ используя СУЩЕСТВУЮЩЕЕ соединение!
                     try:
                         # Обновляем users
                         end_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                        start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        start_str = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')
 
                         cursor.execute('''
-                        UPDATE users 
-                        SET subscription_paid = ?,
-                            subscription_start_date = ?,
-                            subscription_end_date = ?,
-                            is_trial_used = ?,
-                            subscription_purchased = ?,
-                            last_activity = CURRENT_TIMESTAMP
-                        WHERE telegram_id = ?
-                        ''', (True, start_str, end_str, False, True, telegram_id))
+                            UPDATE users 
+                            SET subscription_paid = ?,
+                                subscription_start_date = ?,
+                                subscription_end_date = ?,
+                                is_trial_used = ?,
+                                subscription_purchased = ?,
+                                last_activity = CURRENT_TIMESTAMP
+                            WHERE telegram_id = ?
+                            ''', (True,  # 1 - subscription_paid
+                                  start_str,  # 2 - subscription_start_date
+                                  end_str,  # 3 - subscription_end_date
+                                  False,  # 4 - is_trial_used
+                                  True,  # 5 - subscription_purchased ← ВАЖНО!
+                                  telegram_id))  # 6 - telegram_id
 
                         # Помечаем платеж как обработанный
                         cursor.execute('UPDATE payments SET is_processed = TRUE WHERE payment_id = ?', (payment_id,))
@@ -1867,9 +1901,9 @@ def check_subscription_consistency():
 
         purchased_but_not_active = cursor.fetchall()
         for user in purchased_but_not_active:
-            problem = f"Пользователь {user['telegram_id']} (@{user['username'] or 'нет'}) имеет subscription_purchased=TRUE, но нет активной подписки"
+            problem = f"❌ Пользователь {user['telegram_id']} (@{user['username'] or 'нет'}) КУПИЛ подписку, но она НЕ АКТИВНА!"
             problems.append(problem)
-            logger.warning(f"⚠️ {problem}")
+            logger.warning(problem)
 
         # 2. Проверяем успешные платежи без subscription_purchased
         cursor.execute('''
@@ -1883,11 +1917,31 @@ def check_subscription_consistency():
 
         successful_payments_without_purchase = cursor.fetchall()
         for payment in successful_payments_without_purchase:
-            problem = f"Пользователь {payment['telegram_id']} (@{payment['username'] or 'нет'}) имеет успешный платеж {payment['payment_id']}, но subscription_purchased=FALSE"
+            problem = f"❌ Пользователь {payment['telegram_id']} (@{payment['username'] or 'нет'}) оплатил, но subscription_purchased=FALSE!"
             problems.append(problem)
-            logger.warning(f"⚠️ {problem}")
+            logger.warning(problem)
 
-        # 3. Проверяем пробные подписки, помеченные как покупка
+        # ✅ КОРРЕКТНАЯ ПРОВЕРКА: ТОЛЬКО если есть оплата, но нет подписки И нет пробного доступа
+        cursor.execute('''
+        SELECT u.telegram_id, u.username, u.is_trial_used, u.subscription_purchased
+        FROM users u
+        WHERE u.subscription_purchased = FALSE
+        AND u.subscription_paid = FALSE
+        AND u.is_trial_used = FALSE
+        AND EXISTS (
+            SELECT 1 FROM payments p 
+            WHERE p.telegram_id = u.telegram_id 
+            AND p.status = 'succeeded'
+        )
+        ''')
+
+        weird_cases = cursor.fetchall()
+        for user in weird_cases:
+            problem = f"❌ Пользователь {user['telegram_id']} (@{user['username'] or 'нет'}) оплатил, но нет ни подписки, ни пробного доступа!"
+            problems.append(problem)
+            logger.warning(problem)
+
+        # ℹ️ ИНФОРМАЦИОННОЕ СООБЩЕНИЕ (НЕ ОШИБКА)
         cursor.execute('''
         SELECT telegram_id, username, is_trial_used, subscription_purchased
         FROM users 
@@ -1895,22 +1949,22 @@ def check_subscription_consistency():
         AND subscription_purchased = TRUE
         ''')
 
-        trial_marked_as_purchase = cursor.fetchall()
-        for user in trial_marked_as_purchase:
-            problem = f"Пользователь {user['telegram_id']} (@{user['username'] or 'нет'}) использовал пробный доступ, но помечен как купивший подписку"
-            problems.append(problem)
-            logger.warning(f"⚠️ {problem}")
+        trial_then_purchased = cursor.fetchall()
+        if trial_then_purchased:
+            logger.info(f"ℹ️ Пользователи, которые взяли пробный и потом оплатили: {len(trial_then_purchased)}")
+            for user in trial_then_purchased[:5]:
+                logger.info(f"  • {user['telegram_id']} (@{user['username'] or 'нет'}) - пробный + оплата")
 
         conn.close()
 
         if problems:
-            logger.warning(f"⚠️ Найдено {len(problems)} проблем с согласованностью данных")
+            logger.warning(f"⚠️ Найдено {len(problems)} КРИТИЧЕСКИХ проблем с согласованностью данных")
             for i, problem in enumerate(problems[:10], 1):
                 logger.warning(f"  {i}. {problem}")
             if len(problems) > 10:
                 logger.warning(f"  ... и еще {len(problems) - 10} проблем")
         else:
-            logger.info("✅ Данные о подписках согласованы")
+            logger.info("✅ Данные о подписках полностью согласованы")
 
         return problems
 
@@ -2839,7 +2893,7 @@ def handle_set_admin(message):
 
 @bot.message_handler(commands=['check_sub_sync'])
 def handle_check_sub_sync(message):
-    """Ручная проверка синхронизации подписок"""
+    """Ручная проверка синхронизации подписок - ТЕПЕРЬ С ПОЛНОЙ СИНХРОНИЗАЦИЕЙ"""
     chat_id = message.chat.id
     user = db.get_user(chat_id)
 
@@ -2847,34 +2901,37 @@ def handle_check_sub_sync(message):
         bot.send_message(chat_id, "❌ У вас нет прав для этой команды.")
         return
 
-    bot.send_message(chat_id, "🔄 Запускаю проверку синхронизации подписок...")
+    bot.send_message(chat_id, "🔄 Запускаю ПОЛНУЮ синхронизацию подписок...")
 
     try:
-        # Проверка согласованности
+        # 1. Сначала проверяем согласованность
         problems = check_subscription_consistency()
 
-        # Синхронизация
-        result = sync_paid_subscriptions_on_startup()
+        # 2. ЗАПУСКАЕМ ПОЛНУЮ СИНХРОНИЗАЦИЮ (обновляет subscription_purchased)
+        full_result = full_sync_subscriptions()
+
+        # 3. Старая синхронизация (только новые платежи)
+        old_result = sync_paid_subscriptions_on_startup()
 
         # Формируем отчет
-        report = f"📊 <b>Результаты синхронизации:</b>\n\n"
-        report += f"✅ Всего платежей: {result.get('total', 0)}\n"
-        report += f"✅ Активировано подписок: {result.get('activated', 0)}\n"
-        report += f"⏩ Пропущено: {result.get('skipped', 0)}\n"
-        report += f"❌ Ошибок: {result.get('errors', 0)}\n"
+        report = f"📊 <b>Результаты ПОЛНОЙ синхронизации:</b>\n\n"
 
-        # Используем get() с значением по умолчанию
-        report += f"⏰ Проверялись платежи за: {result.get('max_days', 3)} дня\n\n"
+        report += f"🔧 <b>Исправление subscription_purchased:</b>\n"
+        report += f"✅ Исправлено пользователей: {full_result.get('fixed', 0)}\n"
+        report += f"📋 Всего найдено: {full_result.get('total', 0)}\n\n"
 
-        if 'error' in result:
-            report += f"⚠️ <b>Сообщение об ошибке:</b>\n{result['error'][:200]}\n\n"
+        report += f"💰 <b>Обработка новых платежей:</b>\n"
+        report += f"✅ Всего платежей: {old_result.get('total', 0)}\n"
+        report += f"✅ Активировано подписок: {old_result.get('activated', 0)}\n"
+        report += f"⏩ Пропущено: {old_result.get('skipped', 0)}\n"
+        report += f"❌ Ошибок: {old_result.get('errors', 0)}\n\n"
 
         if problems:
-            report += f"⚠️ <b>Проблемы согласованности:</b> {len(problems)}\n"
-            for i, problem in enumerate(problems[:3], 1):
+            report += f"⚠️ <b>Проблем согласованности:</b> {len(problems)}\n"
+            for i, problem in enumerate(problems[:5], 1):
                 report += f"{i}. {problem[:100]}...\n"
-            if len(problems) > 3:
-                report += f"... и еще {len(problems) - 3} проблем\n"
+            if len(problems) > 5:
+                report += f"... и еще {len(problems) - 5} проблем\n"
         else:
             report += "✅ <b>Проблем с согласованностью не найдено</b>"
 
@@ -2884,6 +2941,7 @@ def handle_check_sub_sync(message):
         error_msg = f"❌ Ошибка выполнения команды /check_sub_sync: {e}"
         bot.send_message(chat_id, error_msg)
         logger.error(error_msg)
+        logger.error(traceback.format_exc())
 
 def main_menu_callback(call):
     """Обработчик главного меню"""
@@ -3041,7 +3099,7 @@ def subscribe_info_callback(call):
             end_datetime = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
             end_str = end_datetime.strftime("%d.%m.%Y в %H:%M")
 
-            time_left = end_datetime - datetime.now()
+            time_left = end_datetime - datetime.now(pytz.UTC)
             if time_left.total_seconds() > 0:
                 days = time_left.days
                 hours = time_left.seconds // 3600
@@ -3199,7 +3257,7 @@ def trial_callback(call):
         if user.get('subscription_end_date'):
             try:
                 end_datetime = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
-                if end_datetime < datetime.now():
+                if end_datetime < datetime.now(pytz.UTC):
                     # Пробный доступ истек, можно предложить платную подписку
                     markup = types.InlineKeyboardMarkup()
                     markup.add(types.InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe"))
@@ -3232,13 +3290,13 @@ def trial_callback(call):
         return
 
     # Даем пробный доступ на 1 день от текущего момента
-    end_datetime = datetime.now() + timedelta(days=1)
+    end_datetime = datetime.now(pytz.UTC) + timedelta(days=1)
 
     # Проверяем, нет ли уже активной подписки
     if user and user.get('subscription_paid') and user.get('subscription_end_date'):
         try:
             current_end = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
-            if current_end > datetime.now():
+            if current_end > datetime.now(pytz.UTC):
                 # Уже есть активная подписка
                 answer_callback_safe(bot, call.id, "✅ У вас уже есть активная подписка!")
                 return
@@ -4149,6 +4207,89 @@ def subscription_terms_callback(call):
     )
     answer_callback_safe(bot, call.id)
 
+
+def full_sync_subscriptions():
+    """ПОЛНАЯ синхронизация - обновляет ВСЕХ пользователей с успешными платежами"""
+    logger.info("🔄 Запуск ПОЛНОЙ синхронизации подписок...")
+
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+
+        # Находим ВСЕХ пользователей с успешными платежами, у которых subscription_purchased = FALSE
+        cursor.execute('''
+        SELECT DISTINCT 
+            p.telegram_id,
+            u.username,
+            u.subscription_paid,
+            u.subscription_end_date,
+            u.subscription_purchased
+        FROM payments p
+        JOIN users u ON p.telegram_id = u.telegram_id
+        WHERE p.status = 'succeeded'
+        AND (u.subscription_purchased = FALSE OR u.subscription_purchased IS NULL)
+        ''')
+
+        users_to_fix = cursor.fetchall()
+
+        if not users_to_fix:
+            logger.info("✅ Нет пользователей для исправления")
+            return {'fixed': 0, 'total': 0}
+
+        fixed_count = 0
+        for user_data in users_to_fix:
+            user_id = user_data[0]
+
+            # Устанавливаем subscription_purchased = TRUE
+            cursor.execute('''
+            UPDATE users 
+            SET subscription_purchased = TRUE,
+                last_activity = CURRENT_TIMESTAMP
+            WHERE telegram_id = ?
+            ''', (user_id,))
+
+            # Также проверяем и обновляем subscription_paid если нужно
+            if not user_data[2]:  # subscription_paid = FALSE
+                # Берем дату из последнего успешного платежа
+                cursor.execute('''
+                SELECT paid_at, created_at
+                FROM payments 
+                WHERE telegram_id = ? AND status = 'succeeded'
+                ORDER BY paid_at DESC, created_at DESC
+                LIMIT 1
+                ''', (user_id,))
+
+                payment = cursor.fetchone()
+                if payment:
+                    payment_date = payment[0] or payment[1]
+                    try:
+                        if payment_date:
+                            start_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            end_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+
+                            cursor.execute('''
+                            UPDATE users 
+                            SET subscription_paid = TRUE,
+                                subscription_start_date = ?,
+                                subscription_end_date = ?
+                            WHERE telegram_id = ?
+                            ''', (start_date, end_date, user_id))
+                    except:
+                        pass
+
+            fixed_count += 1
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"✅ Полная синхронизация: исправлено {fixed_count} пользователей")
+        return {'fixed': fixed_count, 'total': len(users_to_fix)}
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка полной синхронизации: {e}")
+        logger.error(traceback.format_exc())
+        return {'fixed': 0, 'total': 0, 'error': str(e)}
+
 def check_payment_callback(call):
     """Проверка статуса платежа с улучшенной обработкой ошибок"""
     chat_id = call.message.chat.id
@@ -4285,7 +4426,19 @@ def check_payment_callback(call):
             if payment_data and payment_data['is_processed']:
                 # Платеж уже был обработан ранее
                 answer_callback_safe(bot, call.id, "✅ Платеж уже был обработан ранее")
-
+                user = db.get_user(chat_id)
+                if user and not user.get('subscription_purchased'):
+                    # Если пользователь не отмечен как купивший, исправляем
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                            UPDATE users 
+                            SET subscription_purchased = TRUE 
+                            WHERE telegram_id = ?
+                            ''', (chat_id,))
+                    conn.commit()
+                    conn.close()
+                    logger.info(f"✅ Исправлен subscription_purchased для {chat_id}")
                 # Просто показываем статус
                 user_info = db.get_user(chat_id)
                 end_date = user_info.get('subscription_end_date', 'неизвестно')
@@ -4317,18 +4470,18 @@ def check_payment_callback(call):
                     try:
                         current_end = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
                         # Продлеваем от текущей даты окончания, если она в будущем
-                        if current_end > datetime.now():
+                        if current_end > datetime.now(pytz.UTC):
                             end_datetime = current_end + timedelta(days=30)
                         else:
                             # Иначе начинаем с текущего момента + 1 день (буфер)
-                            end_datetime = datetime.now() + timedelta(days=30)
+                            end_datetime = datetime.now(pytz.UTC) + timedelta(days=30)
                     except:
-                        end_datetime = datetime.now() + timedelta(days=30)
+                        end_datetime = datetime.now(pytz.UTC) + timedelta(days=30)
                 else:
-                    end_datetime = datetime.now() + timedelta(days=30)
+                    end_datetime = datetime.now(pytz.UTC) + timedelta(days=30)
             else:
                 # Новая подписка
-                end_datetime = datetime.now() + timedelta(days=30)
+                end_datetime = datetime.now(pytz.UTC) + timedelta(days=30)
 
             # Активируем подписку с пометкой о покупке
             db.update_subscription(
@@ -5233,7 +5386,7 @@ def logs_clear_confirm_callback(call):
         log_file = 'data/bot.log'
         if os.path.exists(log_file):
             # Создаем резервную копию
-            backup_file = f'bot.log.backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            backup_file = f'bot.log.backup_{datetime.now(pytz.UTC).strftime("%Y%m%d_%H%M%S")}'
             shutil.copy2(log_file, backup_file)
 
             # Очищаем файл
@@ -5267,7 +5420,7 @@ def admin_db_callback(call):
         db_file = 'data/users.db'
         if os.path.exists(db_file):
             # Создаем временную копию для безопасности
-            temp_file = f'users_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
+            temp_file = f'users_backup_{datetime.now(pytz.UTC).strftime("%Y%m%d_%H%M%S")}.db'
             shutil.copy2(db_file, temp_file)
 
             with open(temp_file, 'rb') as f:
@@ -5943,14 +6096,15 @@ def log_memory_usage():
 
 
 def check_and_update_subscriptions():
-    """Проверка и обновление подписок с учетом точного времени"""
+    """Проверка и обновление подписок - ВСЕ В UTC"""
     try:
-        current_datetime = datetime.now(NOVOSIBIRSK_TZ)
+        # ИСПОЛЬЗУЕМ UTC, А НЕ NOVOSIBIRSK_TZ!
+        current_datetime = datetime.now(pytz.UTC)
 
         conn = db.get_connection()
         cursor = conn.cursor()
 
-        # Находим истекшие подписки (используем TIMESTAMP сравнение)
+        # Находим истекшие подписки
         cursor.execute('''
         SELECT telegram_id, username, first_name, subscription_end_date 
         FROM users 
@@ -5967,15 +6121,18 @@ def check_and_update_subscriptions():
                 continue
 
             try:
-                # Пытаемся парсить с точным временем
+                # Парсим дату из БД (предполагаем UTC)
                 try:
-                    end_datetime = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
+                    end_naive = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
                 except ValueError:
-                    # Если старый формат, добавляем время 23:59:59
-                    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-                    end_datetime = datetime.combine(end_date, datetime.max.time())
+                    end_naive = datetime.strptime(end_date_str, '%Y-%m-%d')
+                    end_naive = end_naive.replace(hour=23, minute=59, second=59)
 
-                if end_datetime < current_datetime:
+                # Делаем aware (UTC)
+                end_aware = pytz.UTC.localize(end_naive)
+
+                # Сравниваем aware datetime
+                if end_aware < current_datetime:
                     expired_users.append({
                         'id': user_id,
                         'username': username,
@@ -5983,8 +6140,9 @@ def check_and_update_subscriptions():
                         'end_date': end_date_str
                     })
                     users_to_update.append(user_id)
+
             except (ValueError, TypeError) as e:
-                logger.info(f"⚠️ Ошибка парсинга даты для пользователя {user_id}: {e}")
+                logger.error(f"⚠️ Ошибка парсинга даты для пользователя {user_id}: {e}")
                 continue
 
         # Обновляем истекшие подписки
@@ -6004,7 +6162,8 @@ def check_and_update_subscriptions():
         conn.close()
 
     except Exception as e:
-        logger.info(f"❌ Ошибка при проверке подписок: {e}")
+        logger.error(f"❌ Ошибка при проверке подписок: {e}")
+        logger.error(traceback.format_exc())
 
 
 def shutdown_handler(signum=None, frame=None):
