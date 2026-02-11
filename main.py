@@ -8,6 +8,8 @@ import atexit
 import signal
 import sys
 import time
+import requests
+from requests.exceptions import ConnectionError, Timeout
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -23,49 +25,15 @@ import yookassa
 from yookassa import Payment, Configuration
 from yookassa.domain.notification import WebhookNotificationEventType, WebhookNotificationFactory
 import uuid
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+import psutil  # для мониторинга памяти
+from threading import Lock  # для потокобезопасности
 
 # Загрузка переменных окружения
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# ============================================================================
-# КОНСТАНТЫ И КОНФИГУРАЦИЯ
-# ============================================================================
-TOKEN = os.getenv('BOT_TOKEN')
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN не установлен в переменных окружения!")
-user_extend_states = {}
-# Конфигурация ЮKassa - одна цена
-SUBSCRIPTION_PRICE = 69  # Одна цена: 69 рублей за месяц
-SUBSCRIPTION_DAYS = 30    # 30 дней подписка
-
-# Ключи ЮKassa
-YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID')
-YOOKASSA_SECRET_KEY = os.getenv('YOOKASSA_SECRET_KEY')
-
-# Настройка ЮKassa
-if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
-    try:
-        Configuration.account_id = YOOKASSA_SHOP_ID
-        Configuration.secret_key = YOOKASSA_SECRET_KEY
-        print(f"✅ ЮKassa настроена. Цена подписки: {SUBSCRIPTION_PRICE}₽")
-    except Exception as e:
-        print(f"⚠️ Ошибка настройки ЮKassa: {e}")
-else:
-    print("⚠️ ЮKassa не настроена (отсутствуют SHOP_ID или SECRET_KEY)")
-
-bot = telebot.TeleBot(TOKEN)
-NOVOSIBIRSK_TZ = pytz_timezone('Asia/Novosibirsk')
-# Глобальные переменные
-questions_by_topic = {}
-topics_list = []
-questions_loaded = False
-session_stats = {}
-user_data = {}
-scheduler = None
-
-
 def setup_logging():
     """Настройка системы логирования"""
     # Создаем папку /data если её нет
@@ -97,6 +65,34 @@ def setup_logging():
 
 setup_logging()
 logger = logging.getLogger(__name__)
+# ============================================================================
+# КОНСТАНТЫ И КОНФИГУРАЦИЯ
+# ============================================================================
+TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не установлен в переменных окружения!")
+
+# Конфигурация ЮKassa - одна цена
+SUBSCRIPTION_PRICE = 69  # Одна цена: 69 рублей за месяц
+SUBSCRIPTION_DAYS = 30    # 30 дней подписка
+
+# Ключи ЮKassa
+YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID')
+YOOKASSA_SECRET_KEY = os.getenv('YOOKASSA_SECRET_KEY')
+
+# Настройка ЮKassa
+if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+    try:
+        Configuration.account_id = YOOKASSA_SHOP_ID
+        Configuration.secret_key = YOOKASSA_SECRET_KEY
+        logger.info(f"✅ ЮKassa настроена. Цена подписки: {SUBSCRIPTION_PRICE}₽")
+    except Exception as e:
+        logger.info(f"⚠️ Ошибка настройки ЮKassa: {e}")
+else:
+    logger.info("⚠️ ЮKassa не настроена (отсутствуют SHOP_ID или SECRET_KEY)")
+
+bot = telebot.TeleBot(TOKEN)
+NOVOSIBIRSK_TZ = pytz_timezone('Asia/Novosibirsk')
 
 # ============================================================================
 # ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ УДОБНОГО ЛОГИРОВАНИЯ
@@ -125,18 +121,369 @@ def setup_retry_session():
     return session
 
 # Настройка для telebot
-telebot.apihelper.API_URL = "https://api.telegram.org/bot{0}/{1}"
+#telebot.apihelper.API_URL = "https://api.telegram.org/bot{0}/{1}"
 telebot.apihelper.SESSION_TIME_TO_LIVE = 5 * 60
+
+
+# ============================================================================
+# КЛАСС ДЛЯ УПРАВЛЕНИЯ ДАННЫМИ ПОЛЬЗОВАТЕЛЕЙ С TTL
+# ============================================================================
+
+class UserDataManager:
+    """Менеджер данных пользователей с автоматической очисткой"""
+
+    def __init__(self, ttl_minutes=180, cleanup_interval_minutes=30):
+        self.user_data = {}
+        self.session_stats = {}
+        self.broadcast_states = {}
+        self.extend_states = {}
+        self.ttl = ttl_minutes * 60  # в секундах
+        self.last_cleanup = time.time()
+        self.cleanup_interval = cleanup_interval_minutes * 60
+
+    def cleanup_old_data(self):
+        """Очистка устаревших данных"""
+        current_time = time.time()
+
+        if current_time - self.last_cleanup < self.cleanup_interval:
+            return
+
+        logger.info("🧹 Запуск очистки устаревших данных пользователей...")
+
+        # Очищаем user_data
+        to_remove = []
+        for user_id, data in self.user_data.items():
+            if 'last_access' in data and current_time - data['last_access'] > self.ttl:
+                to_remove.append(user_id)
+
+        for user_id in to_remove:
+            del self.user_data[user_id]
+
+        # Очищаем session_stats
+        to_remove = []
+        for user_id in self.session_stats:
+            if user_id not in self.user_data:  # Удаляем если нет в user_data
+                to_remove.append(user_id)
+
+        for user_id in to_remove:
+            del self.session_stats[user_id]
+
+        # Очищаем broadcast_states и extend_states
+        for state_dict in [self.broadcast_states, self.extend_states]:
+            to_remove = []
+            for user_id, state in state_dict.items():
+                if 'timestamp' in state and current_time - state['timestamp'] > self.ttl:
+                    to_remove.append(user_id)
+
+            for user_id in to_remove:
+                del state_dict[user_id]
+
+        self.last_cleanup = current_time
+        logger.info(f"✅ Очищено: user_data={len(to_remove)}, осталось: user_data={len(self.user_data)}")
+
+    def get_user_data(self, user_id):
+        """Получение данных пользователя с обновлением времени доступа"""
+        self.cleanup_old_data()
+
+        if user_id not in self.user_data:
+            self.user_data[user_id] = {
+                'current_topic': None,
+                'current_question': None,
+                'correct_answer': None,
+                'numbered_answers': {},
+                'answers_list': [],
+                'last_access': time.time(),
+                # НОВОЕ: инициализация структур для отслеживания вопросов
+                'answered_questions': {},  # {topic: [question_texts...]}
+                'session_questions': {},  # {topic: {question_text: answered_correctly}}
+                'current_question_topic': None
+            }
+        else:
+            self.user_data[user_id]['last_access'] = time.time()
+
+        return self.user_data[user_id]
+
+    def update_user_data(self, user_id, **kwargs):
+        """Обновление данных пользователя"""
+        data = self.get_user_data(user_id)
+        data.update(kwargs)
+        data['last_access'] = time.time()
+
+    def get_session_stats(self, user_id):
+        """Получение статистики сессии"""
+        self.cleanup_old_data()
+
+        if user_id not in self.session_stats:
+            self.session_stats[user_id] = {
+                'session_total': 0,
+                'session_correct': 0,
+                'last_access': time.time()
+            }
+        else:
+            self.session_stats[user_id]['last_access'] = time.time()
+
+        return self.session_stats[user_id]
+
+    def clear_user_data(self, user_id):
+        """Очистка всех данных пользователя"""
+        for dict_name in [self.user_data, self.session_stats,
+                          self.broadcast_states, self.extend_states]:
+            dict_name.pop(user_id, None)
+
+    def get_memory_usage(self):
+        """Оценка использования памяти"""
+        import sys
+        total_size = 0
+
+        for obj in [self.user_data, self.session_stats,
+                    self.broadcast_states, self.extend_states]:
+            total_size += sys.getsizeof(obj)
+
+        return total_size / 1024 / 1024  # в МБ
+
+    # НОВЫЕ МЕТОДЫ ДЛЯ ЛОГИКИ СЕССИЙ ВОПРОСОВ
+
+    def get_session_questions(self, user_id, topic):
+        """Получение вопросов текущей сессии для темы"""
+        data = self.get_user_data(user_id)
+        if 'session_questions' not in data:
+            data['session_questions'] = {}
+        if topic not in data['session_questions']:
+            data['session_questions'][topic] = {}
+        return data['session_questions'][topic]
+
+    def get_answered_questions(self, user_id, topic):
+        """Получение правильных ответов для темы"""
+        data = self.get_user_data(user_id)
+        if 'answered_questions' not in data:
+            data['answered_questions'] = {}
+        if topic not in data['answered_questions']:
+            data['answered_questions'][topic] = []
+        return data['answered_questions'][topic]
+
+    def mark_question_answered(self, user_id, topic, question_text, is_correct):
+        """Отметка вопроса как отвеченного"""
+        session_questions = self.get_session_questions(user_id, topic)
+
+        if is_correct:
+            # Если ответ правильный, добавляем в список отвеченных
+            answered_questions = self.get_answered_questions(user_id, topic)
+            if question_text not in answered_questions:
+                answered_questions.append(question_text)
+            # В сессии отмечаем как правильно отвеченный
+            session_questions[question_text] = True
+        else:
+            # Если ответ неправильный, отмечаем в сессии
+            session_questions[question_text] = False
+
+    def clear_topic_session(self, user_id, topic):
+        """Очистка сессии для темы"""
+        data = self.get_user_data(user_id)
+        if 'session_questions' not in data:
+            data['session_questions'] = {}
+        if topic in data['session_questions']:
+            data['session_questions'][topic] = {}
+
+
+class ThreadSafeDict:
+    """Потокобезопасный словарь"""
+
+    def __init__(self):
+        self._data = {}
+        self._lock = Lock()
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._data.get(key)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            self._data[key] = value
+
+    def __delitem__(self, key):
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._data.get(key, default)
+
+    def pop(self, key, default=None):
+        with self._lock:
+            return self._data.pop(key, default)
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+
+# ============================================================================
+# КЕШИРОВАНИЕ ДАННЫХ
+# ============================================================================
+
+class CacheManager:
+    """Менеджер кеширования для ускорения работы"""
+
+    def __init__(self, ttl_seconds=300):
+        self.cache = {}
+        self.ttl = ttl_seconds
+
+    def get(self, key):
+        """Получение значения из кеша"""
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return value
+            else:
+                del self.cache[key]  # Удаляем просроченный кеш
+        return None
+
+    def set(self, key, value):
+        """Установка значения в кеш"""
+        self.cache[key] = (value, time.time())
+
+    def delete(self, key):
+        """Удаление значения из кеша"""
+        self.cache.pop(key, None)
+
+    def clear(self):
+        """Очистка кеша"""
+        self.cache.clear()
+
+
+class RateLimiter:
+    """Простой rate limiter"""
+
+    def __init__(self, max_requests=10, per_seconds=60):
+        self.requests = {}
+        self.max_requests = max_requests
+        self.per_seconds = per_seconds
+        self.lock = Lock()
+
+    def check(self, user_id):
+        """Проверка лимита запросов"""
+        with self.lock:
+            current_time = time.time()
+
+            if user_id not in self.requests:
+                self.requests[user_id] = []
+
+            # Очищаем старые запросы
+            self.requests[user_id] = [
+                req_time for req_time in self.requests[user_id]
+                if current_time - req_time < self.per_seconds
+            ]
+
+            # Проверяем лимит
+            if len(self.requests[user_id]) >= self.max_requests:
+                return False
+
+            # Добавляем новый запрос
+            self.requests[user_id].append(current_time)
+            return True
+
+class RateLimiter:
+    def __init__(self, max_requests=10, per_seconds=60):
+        self.requests = {}
+        self.callback_requests = {}  # ОТДЕЛЬНО ДЛЯ CALLBACK
+        self.max_requests = max_requests
+        self.per_seconds = per_seconds
+        self.lock = Lock()
+
+    def check(self, user_id):
+        """Проверка лимита для сообщений"""
+        with self.lock:
+            return self._check_impl(user_id, self.requests)
+
+    def check_callback(self, user_id):
+        """Проверка лимита для callback-запросов (более щадящий)"""
+        with self.lock:
+            return self._check_impl(user_id, self.callback_requests, max_reqs=20)  # 20 запросов в минуту
+
+    def _check_impl(self, user_id, storage, max_reqs=None):
+        """Общая реализация проверки"""
+        current_time = time.time()
+        max_allowed = max_reqs or self.max_requests
+
+        if user_id not in storage:
+            storage[user_id] = []
+
+        # Очищаем старые запросы
+        storage[user_id] = [
+            req_time for req_time in storage[user_id]
+            if current_time - req_time < self.per_seconds
+        ]
+
+        # Проверяем лимит
+        if len(storage[user_id]) >= max_allowed:
+            return False
+
+        # Добавляем новый запрос
+        storage[user_id].append(current_time)
+        return True
 
 # ============================================================================
 # КЛАСС БАЗЫ ДАННЫХ
 # ============================================================================
 class Database:
     def __init__(self, db_path: str = 'data/users.db'):
-        self.db_path = db_path
-        self.create_data_directory()
-        self.init_database()
-        print(f"✅ База данных инициализирована: {self.db_path}")
+            self.db_path = db_path
+            self.conn = None  # ВАЖНО: добавляем этот атрибут
+            self.create_data_directory()
+            self.init_database()
+            self.upgrade_database()
+            logger.info(f"✅ База данных инициализирована: {self.db_path}")
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Получение соединения с базой данных"""
+        # Простая версия - всегда возвращаем новое соединение
+        conn = sqlite3.connect(self.db_path)
+
+        # Добавляем оптимизации для производительности
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=10000')
+            conn.execute('PRAGMA temp_store=MEMORY')
+        except:
+            pass  # Игнорируем ошибки если не поддерживается
+
+        return conn
+    def upgrade_database(self):
+        """Безопасное обновление схемы базы данных"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            # Проверяем существование колонки безопасным способом
+            cursor.execute("PRAGMA table_info(users)")
+            columns = {column[1]: column for column in cursor.fetchall()}
+
+            if 'subscription_purchased' not in columns:
+                # Проверяем версию SQLite
+                cursor.execute("SELECT sqlite_version()")
+                sqlite_version = cursor.fetchone()[0]
+                logger.info(f"🔄 SQLite версия: {sqlite_version}")
+
+                # Безопасное добавление колонки с обработкой ошибок
+                try:
+                    cursor.execute('''
+                    ALTER TABLE users 
+                    ADD COLUMN subscription_purchased BOOLEAN DEFAULT FALSE
+                    ''')
+                    conn.commit()
+                    logger.info("✅ Колонка subscription_purchased добавлена")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" in str(e).lower():
+                        logger.info("ℹ️ Колонка subscription_purchased уже существует")
+                    else:
+                        raise
+
+            conn.close()
+
+        except sqlite3.Error as e:
+            logger.error(f"❌ Ошибка при обновлении базы данных: {e}")
 
     def create_data_directory(self):
         """Создание директории для данных"""
@@ -198,11 +545,8 @@ class Database:
             conn.close()
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при создании базы данных: {e}")
+            logger.info(f"❌ Ошибка при создании базы данных: {e}")
 
-    def get_connection(self) -> sqlite3.Connection:
-        """Получение соединения с базой данных"""
-        return sqlite3.connect(self.db_path)
 
     def add_user(self, telegram_id: int, username=None, first_name=None, last_name=None, is_admin=False) -> bool:
         """Добавление пользователя"""
@@ -228,11 +572,18 @@ class Database:
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при добавлении пользователя: {e}")
+            logger.info(f"❌ Ошибка при добавлении пользователя: {e}")
             return False
 
     def get_user(self, telegram_id: int) -> Optional[Dict]:
-        """Получение информации о пользователе"""
+        """Получение информации о пользователе с кешированием"""
+        cache_key = f"user_{telegram_id}"
+
+        # Пробуем получить из кеша
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             conn = self.get_connection()
             conn.row_factory = sqlite3.Row
@@ -243,48 +594,123 @@ class Database:
             conn.close()
 
             if row:
-                return dict(row)
+                result = dict(row)
+                cache.set(cache_key, result)
+                return result
+
+            cache.set(cache_key, None)
             return None
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при получении пользователя: {e}")
+            logger.info(f"❌ Ошибка при получении пользователя: {e}")
             return None
 
     def check_subscription(self, telegram_id: int) -> bool:
-        """Проверка подписки пользователя с учетом точного времени"""
+        """Проверка подписки с корректной обработкой временных зон"""
         try:
             user = self.get_user(telegram_id)
             if not user:
                 return False
 
-            # Администраторы всегда имеют доступ
             if user.get('is_admin'):
                 return True
 
-            # Проверяем оплату
             if not user.get('subscription_paid'):
                 return False
 
-            # Проверяем дату окончания подписки
-            if user.get('subscription_end_date'):
-                try:
-                    # Парсим дату-время
-                    end_datetime = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
-                    if end_datetime < datetime.now():
-                        return False
-                except (ValueError, TypeError):
-                    # Если формат старый (только дата), пытаемся распарсить
-                    try:
-                        end_date = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d').date()
-                        if end_date < datetime.now().date():
-                            return False
-                    except (ValueError, TypeError):
-                        return False
+            end_date_str = user.get('subscription_end_date')
+            if not end_date_str:
+                return False
 
-            return True
+            # Преобразуем строку в datetime с учетом временной зоны
+            try:
+                # Пробуем парсить с временем
+                end_naive = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                try:
+                    # Пробуем парсить только дату
+                    end_naive = datetime.strptime(end_date_str, '%Y-%m-%d')
+                except ValueError:
+                    return False
+
+            # Добавляем временную зону (предполагаем UTC)
+            try:
+                import pytz
+                end_utc = pytz.UTC.localize(end_naive)
+                now_utc = datetime.now(pytz.UTC)
+                return end_utc > now_utc
+            except ImportError:
+                # Если pytz не установлен, используем naive datetime
+                return end_naive > datetime.now()
 
         except Exception as e:
-            print(f"❌ Ошибка при проверке подписки: {e}")
+            logger.error(f"❌ Ошибка при проверке подписки: {e}")
+            return False
+
+    def update_subscription(self, telegram_id: int, paid_status=True, end_datetime=None,
+                            is_trial=False, is_purchased=False, conn=None) -> bool:
+        """Обновление подписки с инвалидацией кеша"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+
+        try:
+            cursor = conn.cursor()
+
+            if end_datetime:
+                end_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                cursor.execute('''
+                UPDATE users 
+                SET subscription_paid = ?,
+                    subscription_start_date = ?,
+                    subscription_end_date = ?,
+                    is_trial_used = ?,
+                    subscription_purchased = ?,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE telegram_id = ?
+                ''', (paid_status, start_str, end_str, is_trial, is_purchased, telegram_id))
+
+            else:
+                cursor.execute('''
+                UPDATE users 
+                SET subscription_paid = ?,
+                    is_trial_used = ?,
+                    subscription_purchased = ?,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE telegram_id = ?
+                ''', (paid_status, is_trial, is_purchased, telegram_id))
+
+            if close_conn:
+                conn.commit()
+                conn.close()
+
+            # Инвалидация кеша
+            cache_key = f"subscription_{telegram_id}"
+            cache.delete(cache_key)
+            user_cache_key = f"user_{telegram_id}"
+            cache.delete(user_cache_key)
+
+            logger.info(f"✅ Подписка пользователя {telegram_id} обновлена")
+            return True
+
+        except sqlite3.Error as e:
+            logger.error(f"❌ Ошибка SQLite при обновлении подписки для {telegram_id}: {e}")
+            if close_conn and conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+            return False
+        except Exception as e:
+            logger.error(f"❌ Общая ошибка при обновлении подписки для {telegram_id}: {e}")
+            if close_conn and conn:
+                try:
+                    conn.close()
+                except:
+                    pass
             return False
 
     def update_activity(self, telegram_id: int) -> bool:
@@ -304,7 +730,7 @@ class Database:
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при обновлении активности: {e}")
+            logger.info(f"❌ Ошибка при обновлении активности: {e}")
             return False
 
     def get_user_statistics(self, telegram_id: int) -> Optional[Dict]:
@@ -341,7 +767,7 @@ class Database:
             }
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при получении статистики: {e}")
+            logger.info(f"❌ Ошибка при получении статистики: {e}")
             return None
 
     def init_user_statistics(self, telegram_id: int) -> bool:
@@ -367,7 +793,7 @@ class Database:
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при инициализации статистики: {e}")
+            logger.info(f"❌ Ошибка при инициализации статистики: {e}")
             return False
 
     def update_statistics(self, telegram_id: int, is_correct: bool) -> bool:
@@ -399,82 +825,7 @@ class Database:
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при обновлении статистики: {e}")
-            return False
-
-    def update_subscription(self, telegram_id: int, paid_status=True, end_datetime=None, is_trial=False) -> bool:
-        """Обновление подписки с точным временем окончания - ИСПРАВЛЕННАЯ"""
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-
-            # Получаем текущую дату окончания подписки
-            cursor.execute('''
-            SELECT subscription_end_date, subscription_paid 
-            FROM users 
-            WHERE telegram_id = ?
-            ''', (telegram_id,))
-
-            result = cursor.fetchone()
-            current_end_datetime = None
-
-            if result and result[0] and result[1]:  # Есть активная подписка
-                try:
-                    current_end_datetime = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
-                except:
-                    current_end_datetime = None
-
-            # Определяем новую дату окончания
-            if end_datetime:
-                # Если передана конкретная дата
-                new_end_datetime = end_datetime
-            elif is_trial:
-                # Пробная подписка: 1 день от текущего момента или от текущей даты окончания
-                if current_end_datetime and current_end_datetime > datetime.now():
-                    new_end_datetime = current_end_datetime + timedelta(days=1)
-                else:
-                    new_end_datetime = datetime.now() + timedelta(days=1)
-            else:
-                # Обычная подписка: 30 дней от текущего момента или от текущей даты окончания
-                if current_end_datetime and current_end_datetime > datetime.now():
-                    new_end_datetime = current_end_datetime + timedelta(days=30)
-                else:
-                    new_end_datetime = datetime.now() + timedelta(days=30)
-
-            # Форматируем даты в строки для базы данных
-            start_datetime = datetime.now()
-            start_str = start_datetime.strftime('%Y-%m-%d %H:%M:%S')
-            end_str = new_end_datetime.strftime('%Y-%m-%d %H:%M:%S')
-
-            if is_trial:
-                cursor.execute('''
-                UPDATE users 
-                SET subscription_paid = ?, 
-                    subscription_start_date = ?, 
-                    subscription_end_date = ?,
-                    is_trial_used = TRUE,
-                    last_activity = CURRENT_TIMESTAMP
-                WHERE telegram_id = ?
-                ''', (paid_status, start_str, end_str, telegram_id))
-            else:
-                cursor.execute('''
-                UPDATE users 
-                SET subscription_paid = ?, 
-                    subscription_start_date = ?, 
-                    subscription_end_date = ?,
-                    last_activity = CURRENT_TIMESTAMP
-                WHERE telegram_id = ?
-                ''', (paid_status, start_str, end_str, telegram_id))
-
-            conn.commit()
-            conn.close()
-
-            logger.info(
-                f"Подписка пользователя {telegram_id} обновлена до {end_str} (была: {result[0] if result else 'нет'})")
-            return True
-
-        except sqlite3.Error as e:
-            print(f"❌ Ошибка при обновлении подписки: {e}")
+            logger.info(f"❌ Ошибка при обновлении статистики: {e}")
             return False
 
     def get_admin_ids(self) -> List[int]:
@@ -490,7 +841,7 @@ class Database:
             return admin_ids
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при получении администраторов: {e}")
+            logger.info(f"❌ Ошибка при получении администраторов: {e}")
             return []
 
     def get_all_users(self) -> List[Dict]:
@@ -507,7 +858,7 @@ class Database:
             return [dict(row) for row in rows]
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при получении списка пользователей: {e}")
+            logger.info(f"❌ Ошибка при получении списка пользователей: {e}")
             return []
 
     def get_all_statistics(self) -> List[Dict]:
@@ -531,7 +882,7 @@ class Database:
             return [dict(row) for row in rows]
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при получении всей статистики: {e}")
+            logger.info(f"❌ Ошибка при получении всей статистики: {e}")
             return []
 
     def get_top_users(self, limit=10) -> List[Dict]:
@@ -568,7 +919,7 @@ class Database:
             return [dict(row) for row in rows]
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при получении топа: {e}")
+            logger.info(f"❌ Ошибка при получении топа: {e}")
             return []
 
     def reset_user_statistics(self, telegram_id: int) -> bool:
@@ -597,11 +948,11 @@ class Database:
 
             conn.commit()
             conn.close()
-            print(f"✅ Статистика пользователя {telegram_id} сброшена")
+            logger.info(f"✅ Статистика пользователя {telegram_id} сброшена")
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при сбросе статистики: {e}")
+            logger.info(f"❌ Ошибка при сбросе статистики: {e}")
             return False
 
     def is_payment_processed(self, payment_id: str) -> bool:
@@ -658,11 +1009,11 @@ class Database:
             conn.close()
 
             status = "назначен" if is_admin else "снят"
-            print(f"✅ Пользователь {telegram_id} {status} администратором")
+            logger.info(f"✅ Пользователь {telegram_id} {status} администратором")
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при изменении прав администратора: {e}")
+            logger.info(f"❌ Ошибка при изменении прав администратора: {e}")
             return False
 
     def grant_subscription(self, telegram_id: int, days: int = 30) -> bool:
@@ -688,11 +1039,11 @@ class Database:
 
             conn.commit()
             conn.close()
-            print(f"✅ Пользователю {telegram_id} выдана подписка до {end_str}")
+            logger.info(f"✅ Пользователю {telegram_id} выдана подписка до {end_str}")
             return True
 
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при выдаче подписки: {e}")
+            logger.info(f"❌ Ошибка при выдаче подписки: {e}")
             return False
 
     def extend_subscription(self, telegram_id: int, hours: int = 0, days: int = 0) -> bool:
@@ -752,20 +1103,28 @@ class Database:
             return False
 
     def extend_all_active_subscriptions(self, hours: int = 0, days: int = 0) -> dict:
-        """Продление подписки всем пользователям с активной подпиской - ИСПРАВЛЕННАЯ"""
+        """Продление подписки всем пользователям с безопасными запросами"""
         try:
+            logger.info(f"🔄 Начинаю массовое продление подписок: +{days} дней, +{hours} часов")
+
             conn = self.get_connection()
             cursor = conn.cursor()
 
-            # Получаем всех пользователей с активной подпиской
+            # Получаем всех пользователей с активными подписками
             cursor.execute('''
-            SELECT telegram_id, subscription_end_date 
+            SELECT telegram_id, subscription_end_date, username, first_name
             FROM users 
             WHERE subscription_paid = TRUE 
             AND subscription_end_date IS NOT NULL
             ''')
 
             users = cursor.fetchall()
+            logger.info(f"📊 Найдено пользователей для продления: {len(users)}")
+
+            # Логируем первых 5 пользователей для отладки
+            for i, user in enumerate(users[:5]):
+                logger.info(f"   Пользователь {i + 1}: ID={user[0]}, дата окончания={user[1]}")
+
             results = {
                 'total': len(users),
                 'success': 0,
@@ -773,20 +1132,47 @@ class Database:
                 'errors': []
             }
 
-            for telegram_id, current_end_date_str in users:
+            for user_data in users:
                 try:
+                    telegram_id = user_data[0]
+                    current_end_date_str = user_data[1]
+
+                    logger.info(f"🔄 Обработка пользователя {telegram_id}, текущая дата: {current_end_date_str}")
+
+                    # Определяем новую дату окончания
                     if current_end_date_str:
                         try:
+                            # Пытаемся парсить дату
                             current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d %H:%M:%S')
-                            new_end = current_end + timedelta(days=days, hours=hours)
+                            logger.info(f"   Парсинг успешен: {current_end}")
                         except ValueError:
-                            # Если формат неверный, продлеваем от текущего момента
+                            try:
+                                current_end = datetime.strptime(current_end_date_str, '%Y-%m-%d')
+                                logger.info(f"   Парсинг только даты: {current_end}")
+                            except ValueError as e:
+                                logger.error(f"   Ошибка парсинга даты: {e}")
+                                # Если формат неизвестен, используем текущую дату
+                                current_end = datetime.now()
+                                logger.info(f"   Использую текущую дату: {current_end}")
+
+                        # Проверяем, не истекла ли подписка
+                        if current_end > datetime.now():
+                            # Подписка активна - продлеваем от текущей даты окончания
+                            new_end = current_end + timedelta(days=days, hours=hours)
+                            logger.info(f"   Подписка активна, новая дата: {new_end}")
+                        else:
+                            # Подписка истекла - начинаем с текущего момента
                             new_end = datetime.now() + timedelta(days=days, hours=hours)
+                            logger.info(f"   Подписка истекла, новая дата: {new_end}")
+
                     else:
+                        # Если даты нет, начинаем с текущего момента
                         new_end = datetime.now() + timedelta(days=days, hours=hours)
+                        logger.info(f"   Нет даты, новая дата: {new_end}")
 
                     new_end_str = new_end.strftime('%Y-%m-%d %H:%M:%S')
 
+                    # Обновляем дату окончания
                     cursor.execute('''
                     UPDATE users 
                     SET subscription_end_date = ?,
@@ -794,20 +1180,43 @@ class Database:
                     WHERE telegram_id = ?
                     ''', (new_end_str, telegram_id))
 
-                    results['success'] += 1
-                    logger.info(f"Подписка продлена для {telegram_id} до {new_end_str}")
+                    # Проверяем, что обновление произошло
+                    if cursor.rowcount > 0:
+                        logger.info(f"✅ Успешно обновлено {cursor.rowcount} строк для пользователя {telegram_id}")
+                        results['success'] += 1
+                    else:
+                        logger.error(f"❌ Нет обновленных строк для пользователя {telegram_id}")
+                        results['failed'] += 1
+                        results['errors'].append(f"{telegram_id}: нет обновленных строк")
 
                 except Exception as e:
                     results['failed'] += 1
-                    results['errors'].append(f"{telegram_id}: {str(e)}")
-                    logger.error(f"Ошибка продления для {telegram_id}: {e}")
+                    error_msg = f"{telegram_id}: {str(e)}"
+                    results['errors'].append(error_msg)
+                    logger.error(f"❌ Ошибка при продлении подписки пользователя {telegram_id}: {e}")
+                    logger.error(traceback.format_exc())
 
+            # Применяем изменения
             conn.commit()
+            logger.info(f"💾 Изменения сохранены в БД")
+
+            # Проверяем, что изменения применились
+            cursor.execute('''
+            SELECT COUNT(*) FROM users 
+            WHERE subscription_paid = TRUE 
+            AND subscription_end_date IS NOT NULL
+            ''')
+            updated_count = cursor.fetchone()[0]
+            logger.info(f"📊 После обновления: {updated_count} пользователей с активными подписками")
+
             conn.close()
+
+            logger.info(f"✅ Массовое продление завершено: успешно {results['success']}, ошибок {results['failed']}")
             return results
 
         except Exception as e:
-            logger.error(f"Ошибка при массовом продлении подписок: {e}")
+            logger.error(f"❌ Критическая ошибка при массовом продлении подписок: {e}")
+            logger.error(traceback.format_exc())
             return {'total': 0, 'success': 0, 'failed': 0, 'errors': [str(e)]}
 
     def create_payment(self, payment_id: str, telegram_id: int, amount: float, description: str) -> bool:
@@ -825,7 +1234,7 @@ class Database:
             conn.close()
             return True
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при создании платежа: {e}")
+            logger.info(f"❌ Ошибка при создании платежа: {e}")
             return False
 
     def update_payment_status(self, payment_id: str, status: str) -> bool:
@@ -851,7 +1260,7 @@ class Database:
             conn.close()
             return True
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при обновлении статуса платежа: {e}")
+            logger.info(f"❌ Ошибка при обновлении статуса платежа: {e}")
             return False
 
     def mark_payment_processed(self, payment_id: str) -> bool:
@@ -870,258 +1279,277 @@ class Database:
             conn.close()
             return True
         except sqlite3.Error as e:
-            print(f"❌ Ошибка при отметке платежа: {e}")
+            logger.info(f"❌ Ошибка при отметке платежа: {e}")
             return False
 
+# Глобальные переменные
+questions_by_topic = {}
+topics_list = []
+questions_loaded = False
+scheduler = None
+user_data_manager = UserDataManager(ttl_minutes=120, cleanup_interval_minutes=10)
+# Создаем глобальный кеш-менеджер
+cache = CacheManager(ttl_seconds=300)  # 5 минут
+rate_limiter = RateLimiter(max_requests=30, per_seconds=60)  # 30 запросов в минуту
 
+
+
+def cache_questions():
+    """Кеширование вопросов для быстрого доступа"""
+    global all_questions_cache
+    all_questions_cache.clear()
+
+    for topic, questions in questions_by_topic.items():
+        all_questions_cache[topic] = questions.copy()
+
+    logger.info(f"✅ Вопросы закешированы: {len(all_questions_cache)} тем")
 # ============================================================================
 # ФУНКЦИИ ДЛЯ РАБОТЫ С ВОПРОСАМИ
 # ============================================================================
+def check_database_health():
+    """Проверка здоровья базы данных"""
+    logger.info("🏥 Проверка здоровья базы данных...")
+
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+
+        # Проверяем все таблицы
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = cursor.fetchall()
+        logger.info(f"📊 Таблиц в базе данных: {len(tables)}")
+
+        for table in tables:
+            table_name = table[0]
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            count = cursor.fetchone()[0]
+            logger.info(f"  - {table_name}: {count} записей")
+
+        # Проверяем пользователей
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_paid = TRUE")
+        active_subscriptions = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM payments")
+        total_payments = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM payments WHERE status = 'succeeded' AND is_processed = FALSE")
+        unprocessed_payments = cursor.fetchone()[0]
+
+        logger.info(f"👥 Всего пользователей: {total_users}")
+        logger.info(f"✅ Активных подписок: {active_subscriptions}")
+        logger.info(f"💰 Всего платежей: {total_payments}")
+        logger.info(f"⏳ Необработанных успешных платежей: {unprocessed_payments}")
+
+        conn.close()
+
+        return {
+            'tables': len(tables),
+            'total_users': total_users,
+            'active_subscriptions': active_subscriptions,
+            'total_payments': total_payments,
+            'unprocessed_payments': unprocessed_payments
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при проверке здоровья базы данных: {e}")
+        return None
+
+
 def load_and_parse_questions(filename: str) -> bool:
-    """Загрузка и парсинг вопросов из файла"""
+    """Оптимизированная загрузка вопросов"""
     global questions_by_topic, topics_list, questions_loaded
 
     try:
         if not os.path.exists(filename):
-            print(f"❌ Файл '{filename}' не найден!")
+            logger.info(f"❌ Файл '{filename}' не найден!")
             return False
 
+        # Используем более быстрый парсинг
         with open(filename, 'r', encoding='utf-8') as f:
             content = f.read()
 
         questions_by_topic.clear()
         topics_list.clear()
 
-        # Разделяем по темам (строки с "МДК")
-        lines = content.split('\n')
-
+        # Используем словарь для временного хранения
+        temp_topics = {}
         current_topic = None
         current_question = None
+        current_question_text = None
+        current_question_number = None  # НОВОЕ: для хранения номера вопроса
         current_answers = []
-        in_question = False
 
-        for i, line in enumerate(lines):
+        lines = content.split('\n')
+
+        for line in lines:
             line = line.strip()
-
-            # Пропускаем пустые строки
-            if not line:
+            if not line:  # Пропускаем пустые строки
                 continue
 
-            # Проверяем, является ли строка темой (начинается с МДК)
+            # Проверяем, является ли строка темой
             if line.startswith('МДК'):
-                # Сохраняем предыдущий вопрос, если есть
-                if current_question and current_answers:
-                    if current_topic:
-                        # Удаляем возможные дубликаты в тексте вопроса
-                        current_question = ' '.join(current_question.split())
-                        questions_by_topic[current_topic].append({
-                            'question': current_question,
-                            'answers': current_answers.copy()
-                        })
+                # Сохраняем предыдущий вопрос если есть
+                if current_topic and current_question and current_question_text:
+                    temp_topics.setdefault(current_topic, []).append({
+                        'number': current_question_number,  # Номер вопроса
+                        'question': current_question_text,  # Текст вопроса
+                        'full_question': current_question,  # Полная строка с номером
+                        'answers': current_answers.copy()
+                    })
 
-                # Начинаем новую тему
                 current_topic = line
-                if current_topic not in questions_by_topic:
-                    questions_by_topic[current_topic] = []
-                    topics_list.append(current_topic)
-
                 current_question = None
+                current_question_text = None
+                current_question_number = None
                 current_answers = []
-                in_question = False
-                continue
 
-            # Проверяем, является ли строка началом вопроса (начинается с числа и точки)
-            if re.match(r'^\d+\.', line):
-                # Сохраняем предыдущий вопрос, если есть
-                if current_question and current_answers:
-                    if current_topic:
-                        # Удаляем возможные дубликаты в тексте вопроса
-                        current_question = ' '.join(current_question.split())
-                        questions_by_topic[current_topic].append({
-                            'question': current_question,
-                            'answers': current_answers.copy()
-                        })
+            # Проверяем, является ли строка номером вопроса
+            elif re.match(r'^\d+\.', line):
+                # Сохраняем предыдущий вопрос если есть
+                if current_topic and current_question and current_question_text:
+                    temp_topics.setdefault(current_topic, []).append({
+                        'number': current_question_number,
+                        'question': current_question_text,
+                        'full_question': current_question,
+                        'answers': current_answers.copy()
+                    })
 
                 # Извлекаем номер вопроса
-                match = re.match(r'^(\d+)\.\s*(.*)', line)
+                match = re.match(r'^(\d+)\.', line)
                 if match:
-                    question_number = match.group(1)
-                    question_text = match.group(2).strip()
+                    current_question_number = int(match.group(1))  # Номер вопроса как число
 
-                    # Если после номера есть только "Выберите правильный ответ" или пусто,
-                    # то текст вопроса может быть на следующей строке
-                    if not question_text or question_text.lower() == 'выберите правильный ответ':
-                        # Ищем текст вопроса на следующих непустых строках до первого ответа
-                        question_lines = []
-                        j = i + 1
-                        while j < len(lines):
-                            next_line = lines[j].strip()
-                            if not next_line:
-                                j += 1
-                                continue
+                # Сохраняем полную строку вопроса
+                current_question = line
+                current_question_text = None  # Сброс текста вопроса
+                current_answers = []
 
-                            # Если следующая строка начинается с + или -, это ответ
-                            if next_line.startswith('+') or next_line.startswith('-'):
-                                break
+            # Проверяем, является ли строка текстом вопроса (идет сразу после номера)
+            elif current_question and current_question_text is None and not line.startswith(('+', '-')) and line:
+                # Это текст вопроса
+                current_question_text = line
 
-                            # Если следующая строка начинается с числа и точки, это новый вопрос
-                            if re.match(r'^\d+\.', next_line):
-                                break
-
-                            # Если следующая строка начинается с МДК, это новая тема
-                            if next_line.startswith('МДК'):
-                                break
-
-                            question_lines.append(next_line)
-                            j += 1
-
-                        if question_lines:
-                            question_text = ' '.join(question_lines)
-                        elif not question_text:
-                            question_text = f"Вопрос {question_number}"
-                    else:
-                        # Если есть текст вопроса, но он может быть неполным
-                        # Ищем продолжение на следующих строках до ответа
-                        j = i + 1
-                        while j < len(lines):
-                            next_line = lines[j].strip()
-                            if not next_line:
-                                j += 1
-                                continue
-
-                            # Если следующая строка начинается с + или -, это ответ
-                            if next_line.startswith('+') or next_line.startswith('-'):
-                                break
-
-                            # Если следующая строка начинается с числа и точки, это новый вопрос
-                            if re.match(r'^\d+\.', next_line):
-                                break
-
-                            # Если следующая строка начинается с МДК, это новая тема
-                            if next_line.startswith('МДК'):
-                                break
-
-                            # Это продолжение текста вопроса
-                            question_text += ' ' + next_line
-                            j += 1
-
-                    current_question = f"{question_number}. {question_text}"
-                    current_answers = []
-                    in_question = True
-                continue
-
-            # Если мы внутри вопроса и строка начинается с + или -, это ответ
-            if in_question and (line.startswith('+') or line.startswith('-')):
-                is_correct = line.startswith('+')
-                # Извлекаем текст ответа
-                # Убираем + или - и возможный пробел
+            # Проверяем, является ли строка вариантом ответа
+            elif current_question and (line.startswith('+') or line.startswith('-')):
                 answer_text = line[1:].strip()
-                # Если после знака есть пробел, убираем его
-                if answer_text.startswith(' '):
-                    answer_text = answer_text[1:]
-
-                # Ищем продолжение ответа на следующих строках
-                j = i + 1
-                while j < len(lines):
-                    next_line = lines[j].strip()
-                    if not next_line:
-                        j += 1
-                        continue
-
-                    # Если следующая строка начинается с + или -, это новый ответ
-                    if next_line.startswith('+') or next_line.startswith('-'):
-                        break
-
-                    # Если следующая строка начинается с числа и точки, это новый вопрос
-                    if re.match(r'^\d+\.', next_line):
-                        break
-
-                    # Если следующая строка начинается с МДК, это новая тема
-                    if next_line.startswith('МДК'):
-                        break
-
-                    # Это продолжение ответа
-                    answer_text += ' ' + next_line
-                    j += 1
-
                 if answer_text:
                     current_answers.append({
                         'text': answer_text,
-                        'correct': is_correct
+                        'correct': line.startswith('+')
                     })
-                continue
 
         # Сохраняем последний вопрос
-        if current_topic and current_question and current_answers:
-            # Удаляем возможные дубликаты в тексте вопроса
-            current_question = ' '.join(current_question.split())
-            questions_by_topic[current_topic].append({
-                'question': current_question,
+        if current_topic and current_question and current_question_text:
+            temp_topics.setdefault(current_topic, []).append({
+                'number': current_question_number,
+                'question': current_question_text,
+                'full_question': current_question,
                 'answers': current_answers
             })
 
-        # Проверяем, что все вопросы имеют хотя бы один правильный ответ
-        for topic in questions_by_topic:
-            for question in questions_by_topic[topic]:
-                has_correct = any(answer['correct'] for answer in question['answers'])
-                if not has_correct and question['answers']:
-                    # Если нет правильного ответа, помечаем первый как правильный
-                    question['answers'][0]['correct'] = True
-                    print(f"⚠️ В теме '{topic}' вопрос без правильного ответа: {question['question'][:50]}...")
+        # Копируем в глобальные переменные
+        questions_by_topic.update(temp_topics)
+        topics_list = list(temp_topics.keys())
 
-        # Добавляем опцию "Все темы"
         if topics_list:
             topics_list.append("🎲 Все темы (рандом)")
             questions_loaded = True
 
-            print(f"\n✅ Загружено {len(topics_list) - 1} тем")
-            total_questions = 0
-            for topic in topics_list:
-                if topic != "🎲 Все темы (рандом)":
-                    topic_questions = len(questions_by_topic[topic])
-                    total_questions += topic_questions
-                    print(f"  - {topic}: {topic_questions} вопросов")
+        # Подсчитываем общее количество вопросов
+        total_questions = sum(len(q) for q in questions_by_topic.values())
+        logger.info(f"✅ Загружено тем: {len(topics_list) - 1}, вопросов: {total_questions}")
 
-            print(f"📊 Всего вопросов: {total_questions}")
+        # Выводим пример для проверки
+        if topics_list and questions_by_topic:
+            first_topic = topics_list[0]
+            if questions_by_topic[first_topic]:
+                example = questions_by_topic[first_topic][0]
+                logger.info(f"📝 Пример вопроса из '{first_topic}':")
+                logger.info(f"   Номер: {example.get('number', 'N/A')}")
+                logger.info(f"   Полная строка: {example.get('full_question', 'N/A')}")
+                logger.info(f"   Текст вопроса: {example['question'][:50]}...")
+                logger.info(f"   Ответов: {len(example['answers'])}")
 
-            # Отладочная информация - выводим несколько примеров вопросов
-            print("\n🔍 Примеры загруженных вопросов:")
-            for topic in list(questions_by_topic.keys())[:2]:
-                print(f"\nТема: {topic}")
-                for i, question in enumerate(questions_by_topic[topic][:3], 1):
-                    print(f"  {i}. {question['question'][:80]}...")
-
-            return True
-        else:
-            print("❌ Не удалось загрузить ни одной темы")
-            return False
+        return True
 
     except Exception as e:
-        print(f"❌ Ошибка при загрузке вопросов: {e}")
-        traceback.print_exc()
+        logger.error(f"❌ Ошибка загрузки: {e}")
+        logger.error(traceback.format_exc())
         return False
 
 
-def get_random_question_from_topic(topic_name: str) -> Optional[Dict]:
-    """Получение случайного вопроса из темы"""
+def get_random_question_from_topic(user_id, topic_name: str) -> Optional[Dict]:
+    """Получение случайного вопроса из темы с учетом уже отвеченных"""
     try:
+        # Получаем все вопросы для темы
         if topic_name == "🎲 Все темы (рандом)":
             all_questions = []
             for topic in questions_by_topic.keys():
-                all_questions.extend(questions_by_topic[topic])
-
-            if not all_questions:
-                return None
-
-            return random.choice(all_questions)
+                for question in questions_by_topic[topic]:
+                    question_copy = question.copy()
+                    question_copy['source_topic'] = topic  # Сохраняем исходную тему
+                    all_questions.append(question_copy)
         elif topic_name in questions_by_topic:
-            questions = questions_by_topic[topic_name]
-            if questions:
-                return random.choice(questions)
+            all_questions = questions_by_topic[topic_name].copy()
+            for question in all_questions:
+                question['source_topic'] = topic_name  # Добавляем исходную тему
+        else:
+            return None
 
-        return None
+        if not all_questions:
+            return None
+
+        # Получаем данные пользователя
+        user_data = user_data_manager.get_user_data(user_id)
+
+        # Получаем отвеченные вопросы для этой темы
+        answered_questions = []
+        if 'answered_questions' in user_data and topic_name in user_data['answered_questions']:
+            answered_questions = user_data['answered_questions'][topic_name]
+
+        # Получаем вопросы текущей сессии
+        session_questions = {}
+        if 'session_questions' in user_data and topic_name in user_data['session_questions']:
+            session_questions = user_data['session_questions'][topic_name]
+
+        # Фильтруем вопросы
+        available_questions = []
+        incorrect_questions = []
+
+        for question in all_questions:
+            question_text = question['question']
+
+            # Если вопрос уже правильно отвечен в этой теме, пропускаем
+            if question_text in answered_questions:
+                continue
+
+            # Если вопрос в текущей сессии
+            if question_text in session_questions:
+                if session_questions[question_text] == True:
+                    # Уже правильно отвечен в этой сессии
+                    continue
+                else:
+                    # Неправильно отвечен - добавляем в список неправильных
+                    incorrect_questions.append(question)
+            else:
+                # Новый вопрос
+                available_questions.append(question)
+
+        # Сначала используем новые вопросы, потом неправильно отвеченные
+        if available_questions:
+            return random.choice(available_questions)
+        elif incorrect_questions:
+            return random.choice(incorrect_questions)
+        else:
+            # Все вопросы отвечены правильно
+            return None
+
     except Exception as e:
-        print(f"❌ Ошибка при получении вопроса: {e}")
+        logger.error(f"❌ Ошибка при получении вопроса: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -1130,29 +1558,372 @@ def check_and_load_questions() -> bool:
     global questions_loaded
 
     if os.path.exists('тест.txt'):
-        print("📂 Файл 'тест.txt' найден. Загружаю вопросы...")
+        logger.info("📂 Файл 'тест.txt' найден. Загружаю вопросы...")
         questions_loaded = load_and_parse_questions('тест.txt')
         if questions_loaded:
-            print("✅ Вопросы успешно загружены!")
+            logger.info("✅ Вопросы успешно загружены!")
         else:
-            print("❌ Не удалось загрузить вопросы")
+            logger.info("❌ Не удалось загрузить вопросы")
         return questions_loaded
     else:
-        print("❌ Файл 'тест.txt' не найден!")
+        logger.info("❌ Файл 'тест.txt' не найден!")
         return False
 
 
 # ============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================================
-db = Database()
 
+
+
+def send_message_async(chat_id, text, parse_mode=None, reply_markup=None):
+    """Асинхронная отправка сообщений без блокировки основного потока"""
+    import threading
+
+    def send():
+        try:
+            bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True  # Ускоряет отправку
+            )
+        except Exception as e:
+            logger.error(f"Ошибка асинхронной отправки: {e}")
+
+    thread = threading.Thread(target=send)
+    thread.daemon = True  # Поток завершится с основным
+    thread.start()
+
+def sync_paid_subscriptions_on_startup():
+    """Синхронизация оплаченных подписок"""
+    logger.info("🔄 Запуск синхронизации оплаченных подписок...")
+
+    try:
+        conn = db.get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        MAX_DAYS_FOR_PAYMENT_CHECK = 3  # Добавляем константу
+        ACTIVATION_WINDOW_HOURS = 24
+
+        cursor.execute(f'''
+            SELECT 
+                p.payment_id,
+                p.telegram_id,
+                p.amount,
+                p.created_at,
+                p.paid_at,
+                u.subscription_paid,
+                u.subscription_end_date,
+                u.subscription_purchased,
+                u.subscription_start_date,
+                u.username
+            FROM payments p
+            LEFT JOIN users u ON p.telegram_id = u.telegram_id
+            WHERE p.status = 'succeeded' 
+            AND p.is_processed = FALSE
+            AND (
+                p.paid_at >= datetime('now', '-{MAX_DAYS_FOR_PAYMENT_CHECK} days')
+                OR 
+                (p.paid_at IS NULL AND p.created_at >= datetime('now', '-{MAX_DAYS_FOR_PAYMENT_CHECK} days'))
+            )
+            ORDER BY p.paid_at ASC, p.created_at ASC
+            ''')
+
+        payments = cursor.fetchall()
+
+        if not payments:
+            logger.info(f"✅ Нет свежих необработанных платежей")
+            conn.close()
+            # ВОЗВРАЩАЕМ max_days
+            return {
+                'total': 0,
+                'activated': 0,
+                'skipped': 0,
+                'errors': 0,
+                'max_days': MAX_DAYS_FOR_PAYMENT_CHECK  # Добавлено
+            }
+
+        logger.info(f"📋 Найдено {len(payments)} платежей")
+
+        activated_count = 0
+        skipped_count = 0
+        errors_count = 0
+
+        for payment in payments:
+            try:
+                payment_id = payment['payment_id']
+                telegram_id = payment['telegram_id']
+                username = payment['username'] or f"user_{telegram_id}"
+                paid_at = payment['paid_at']
+
+                logger.info(f"\n🔍 Обработка платежа {payment_id} для {username}")
+
+                # Определяем время платежа
+                payment_datetime = None
+                if paid_at:
+                    try:
+                        payment_datetime = datetime.strptime(paid_at, '%Y-%m-%d %H:%M:%S')
+                    except:
+                        pass
+
+                if not payment_datetime:
+                    # Пропускаем если не удалось определить дату
+                    cursor.execute('UPDATE payments SET is_processed = TRUE WHERE payment_id = ?', (payment_id,))
+                    skipped_count += 1
+                    continue
+
+                # Проверяем текущую подписку
+                subscription_end_date = payment['subscription_end_date']
+                subscription_end_datetime = None
+                user_has_active_subscription = False
+
+                if (payment['subscription_paid'] == 1 and subscription_end_date):
+                    try:
+                        subscription_end_datetime = datetime.strptime(subscription_end_date, '%Y-%m-%d %H:%M:%S')
+                        user_has_active_subscription = subscription_end_datetime > datetime.now()
+                    except:
+                        pass
+
+                user_has_purchased_subscription = payment['subscription_purchased'] == 1
+
+                # Логика активации
+                should_activate = False
+
+                if not user_has_active_subscription:
+                    should_activate = True
+                elif user_has_active_subscription and not user_has_purchased_subscription:
+                    should_activate = True
+                elif user_has_active_subscription and user_has_purchased_subscription:
+                    if subscription_end_datetime:
+                        hours_until_expiry = (subscription_end_datetime - datetime.now()).total_seconds() / 3600
+                        if hours_until_expiry <= ACTIVATION_WINDOW_HOURS:
+                            should_activate = True
+
+                if should_activate:
+                    # Определяем дату окончания
+                    if user_has_active_subscription and subscription_end_datetime:
+                        if subscription_end_datetime > datetime.now():
+                            end_datetime = subscription_end_datetime + timedelta(days=30)
+                        else:
+                            end_datetime = datetime.now() + timedelta(days=30)
+                    else:
+                        end_datetime = payment_datetime + timedelta(days=30)
+
+                    # Корректируем если платеж был давно
+                    hours_since_payment = (datetime.now() - payment_datetime).total_seconds() / 3600
+                    if hours_since_payment > 24:
+                        end_datetime = datetime.now() + timedelta(days=30)
+
+                    # ОБНОВЛЯЕМ ПОДПИСКУ используя СУЩЕСТВУЮЩЕЕ соединение!
+                    try:
+                        # Обновляем users
+                        end_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                        start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                        cursor.execute('''
+                        UPDATE users 
+                        SET subscription_paid = ?,
+                            subscription_start_date = ?,
+                            subscription_end_date = ?,
+                            is_trial_used = ?,
+                            subscription_purchased = ?,
+                            last_activity = CURRENT_TIMESTAMP
+                        WHERE telegram_id = ?
+                        ''', (True, start_str, end_str, False, True, telegram_id))
+
+                        # Помечаем платеж как обработанный
+                        cursor.execute('UPDATE payments SET is_processed = TRUE WHERE payment_id = ?', (payment_id,))
+
+                        activated_count += 1
+                        logger.info(f"   ✅ Подписка активирована до {end_str}")
+
+                        # Отправляем уведомление
+                        try:
+                            bot.send_message(
+                                telegram_id,
+                                f"🎉 <b>Ваша подписка активирована!</b>\n\n"
+                                f"Подписка действует до: {end_datetime.strftime('%d.%m.%Y %H:%M')}",
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            logger.warning(f"   ⚠️ Не удалось отправить уведомление: {e}")
+
+                    except Exception as e:
+                        errors_count += 1
+                        logger.error(f"   ❌ Ошибка обновления: {e}")
+
+                else:
+                    # Не активируем, но помечаем как обработанный
+                    cursor.execute('UPDATE payments SET is_processed = TRUE WHERE payment_id = ?', (payment_id,))
+                    skipped_count += 1
+                    logger.info(f"   ⏩ Пропущен платеж")
+
+            except Exception as e:
+                errors_count += 1
+                logger.error(f"❌ Ошибка при обработке платежа: {e}")
+                logger.error(traceback.format_exc())
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"📊 Итоги: активировано {activated_count}, пропущено {skipped_count}, ошибок {errors_count}")
+
+        # ВОЗВРАЩАЕМ max_days
+        return {
+            'total': len(payments),
+            'activated': activated_count,
+            'skipped': skipped_count,
+            'errors': errors_count,
+            'max_days': MAX_DAYS_FOR_PAYMENT_CHECK  # Добавлено
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка при синхронизации: {e}")
+        # ВОЗВРАЩАЕМ max_days даже при ошибке
+        return {
+            'total': 0,
+            'activated': 0,
+            'skipped': 0,
+            'errors': 1,
+            'max_days': 3,
+            'error': str(e)
+        }
+
+
+def cleanup_old_payments():
+    """Очистка старых необработанных платежей (старше 7 дней)"""
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+
+        # Находим старые необработанные платежи (старше 7 дней)
+        cursor.execute('''
+        SELECT COUNT(*) as count
+        FROM payments 
+        WHERE is_processed = FALSE
+        AND (
+            (paid_at IS NOT NULL AND paid_at < datetime('now', '-7 days'))
+            OR 
+            (paid_at IS NULL AND created_at < datetime('now', '-7 days'))
+        )
+        ''')
+
+        old_payments_count = cursor.fetchone()[0]
+
+        if old_payments_count > 0:
+            # Помечаем старые платежи как обработанные
+            cursor.execute('''
+            UPDATE payments 
+            SET is_processed = TRUE,
+                status = CASE 
+                    WHEN status = 'pending' THEN 'expired' 
+                    ELSE status 
+                END
+            WHERE is_processed = FALSE
+            AND (
+                (paid_at IS NOT NULL AND paid_at < datetime('now', '-7 days'))
+                OR 
+                (paid_at IS NULL AND created_at < datetime('now', '-7 days'))
+            )
+            ''')
+
+            conn.commit()
+            logger.info(f"🧹 Очищено {old_payments_count} старых необработанных платежей (старше 7 дней)")
+
+        conn.close()
+        return old_payments_count
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при очистке старых платежей: {e}")
+        return 0
+
+
+def check_subscription_consistency():
+    """Проверка согласованности данных о подписках"""
+    logger.info("🔍 Запуск проверки согласованности данных о подписках...")
+
+    try:
+        conn = db.get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        problems = []
+
+        # 1. Проверяем пользователей с subscription_purchased = TRUE, но без активной подписки
+        cursor.execute('''
+        SELECT telegram_id, username, subscription_purchased, 
+               subscription_paid, subscription_end_date
+        FROM users 
+        WHERE subscription_purchased = TRUE 
+        AND (
+            subscription_paid = FALSE 
+            OR subscription_end_date IS NULL 
+            OR subscription_end_date < CURRENT_TIMESTAMP
+        )
+        ''')
+
+        purchased_but_not_active = cursor.fetchall()
+        for user in purchased_but_not_active:
+            problem = f"Пользователь {user['telegram_id']} (@{user['username'] or 'нет'}) имеет subscription_purchased=TRUE, но нет активной подписки"
+            problems.append(problem)
+            logger.warning(f"⚠️ {problem}")
+
+        # 2. Проверяем успешные платежи без subscription_purchased
+        cursor.execute('''
+        SELECT p.telegram_id, u.username, p.payment_id, p.paid_at,
+               u.subscription_purchased
+        FROM payments p
+        JOIN users u ON p.telegram_id = u.telegram_id
+        WHERE p.status = 'succeeded'
+        AND u.subscription_purchased = FALSE
+        ''')
+
+        successful_payments_without_purchase = cursor.fetchall()
+        for payment in successful_payments_without_purchase:
+            problem = f"Пользователь {payment['telegram_id']} (@{payment['username'] or 'нет'}) имеет успешный платеж {payment['payment_id']}, но subscription_purchased=FALSE"
+            problems.append(problem)
+            logger.warning(f"⚠️ {problem}")
+
+        # 3. Проверяем пробные подписки, помеченные как покупка
+        cursor.execute('''
+        SELECT telegram_id, username, is_trial_used, subscription_purchased
+        FROM users 
+        WHERE is_trial_used = TRUE 
+        AND subscription_purchased = TRUE
+        ''')
+
+        trial_marked_as_purchase = cursor.fetchall()
+        for user in trial_marked_as_purchase:
+            problem = f"Пользователь {user['telegram_id']} (@{user['username'] or 'нет'}) использовал пробный доступ, но помечен как купивший подписку"
+            problems.append(problem)
+            logger.warning(f"⚠️ {problem}")
+
+        conn.close()
+
+        if problems:
+            logger.warning(f"⚠️ Найдено {len(problems)} проблем с согласованностью данных")
+            for i, problem in enumerate(problems[:10], 1):
+                logger.warning(f"  {i}. {problem}")
+            if len(problems) > 10:
+                logger.warning(f"  ... и еще {len(problems) - 10} проблем")
+        else:
+            logger.info("✅ Данные о подписках согласованы")
+
+        return problems
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при проверке согласованности данных: {e}")
+        logger.error(traceback.format_exc())
+        return None
 
 def create_yookassa_payment(telegram_id: int) -> Optional[Dict]:
     """Создание платежа в ЮKassa - упрощенная версия"""
     try:
         if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
-            print("❌ ЮKassa не настроена")
+            logger.info("❌ ЮKassa не настроена")
             return None
 
         # Генерируем уникальный ID для платежа
@@ -1181,7 +1952,7 @@ def create_yookassa_payment(telegram_id: int) -> Optional[Dict]:
 
         # Сохраняем платеж в базу данных
         if db.create_payment(payment.id, telegram_id, SUBSCRIPTION_PRICE, description):
-            print(f"✅ Создан платеж {payment.id} для пользователя {telegram_id}")
+            logger.info(f"✅ Создан платеж {payment.id} для пользователя {telegram_id}")
             return {
                 'id': payment.id,
                 'status': payment.status,
@@ -1190,11 +1961,11 @@ def create_yookassa_payment(telegram_id: int) -> Optional[Dict]:
                 'description': description
             }
         else:
-            print(f"❌ Не удалось сохранить платеж в БД")
+            logger.info(f"❌ Не удалось сохранить платеж в БД")
             return None
 
     except Exception as e:
-        print(f"❌ Ошибка при создании платежа: {e}")
+        logger.info(f"❌ Ошибка при создании платежа: {e}")
         return None
 
 def check_user_access(chat_id: int, send_message: bool = True) -> bool:
@@ -1284,7 +2055,7 @@ def setup_bot_commands():
         ]
 
         bot.set_my_commands(commands)
-        print("✅ Основные команды бота настроены")
+        logger.info("✅ Основные команды бота настроены")
 
         # Команды для администраторов
         admin_commands = [
@@ -1301,6 +2072,7 @@ def setup_bot_commands():
             types.BotCommand("grant_sub", "Выдать подписку"),
             types.BotCommand("extend_sub", "Продлить подписку"),  # НОВАЯ КОМАНДА
             types.BotCommand("set_admin", "Назначить админа"),
+            types.BotCommand("check_sub_sync", "Синхронизация подписок"),
             types.BotCommand("send_all_users", "Массовая рассылка"),
         ]
 
@@ -1312,16 +2084,26 @@ def setup_bot_commands():
                     admin_commands,
                     scope=types.BotCommandScopeChat(admin_id)
                 )
-                print(f"✅ Админские команды настроены для {admin_id}")
+                logger.info(f"✅ Админские команды настроены для {admin_id}")
             except Exception as e:
-                print(f"⚠️ Ошибка настройки админских команд для {admin_id}: {e}")
+                logger.info(f"⚠️ Ошибка настройки админских команд для {admin_id}: {e}")
 
         return True
 
     except Exception as e:
-        print(f"❌ Ошибка настройки команд бота: {e}")
+        logger.info(f"❌ Ошибка настройки команд бота: {e}")
         return False
-
+def answer_callback_safe(bot_instance, call_id, text=None, show_alert=False):
+    """Безопасный ответ на callback query"""
+    try:
+        if text:
+            bot_instance.answer_callback_query(call_id, text=text, show_alert=show_alert)
+        else:
+            bot_instance.answer_callback_query(call_id)
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось ответить на callback {call_id}: {e}")
+        return False
 
 # ============================================================================
 # ОСНОВНЫЕ ОБРАБОТЧИКИ СООБЩЕНИЙ (ВКЛЮЧАЯ АДМИНИСТРАТИВНЫЕ)
@@ -1373,7 +2155,7 @@ def handle_help(message):
 
 
 def send_question_inline(chat_id, message_id=None):
-    """Отправка вопроса с вариантами ответов"""
+    """Отправка вопроса с вариантами ответов с учетом логики сессии"""
     # Проверяем доступ
     if not check_user_access(chat_id, send_message=False):
         if message_id:
@@ -1395,7 +2177,10 @@ def send_question_inline(chat_id, message_id=None):
             )
         return
 
-    if chat_id not in user_data or not user_data[chat_id].get('current_topic'):
+    # Получаем данные пользователя
+    user_data = user_data_manager.get_user_data(chat_id)
+
+    if not user_data.get('current_topic'):
         if message_id:
             bot.edit_message_text(
                 chat_id=chat_id,
@@ -1411,74 +2196,137 @@ def send_question_inline(chat_id, message_id=None):
             )
         return
 
-    topic = user_data[chat_id]['current_topic']
+    topic = user_data['current_topic']
 
-    # Получаем случайный вопрос из темы
-    question_data = get_random_question_from_topic(topic)
+    # Получаем случайный вопрос из темы с учетом логики сессии
+    question_data = get_random_question_from_topic(chat_id, topic)
 
     if not question_data:
+        # Все вопросы в теме отвечены правильно
+        # Очищаем сессию для этой темы
+        user_data_manager.clear_topic_session(chat_id, topic)
+
+        # Получаем статистику сессии
+        session_stats_data = user_data_manager.get_session_stats(chat_id)
+        session_total = session_stats_data.get('session_total', 0)
+        session_correct = session_stats_data.get('session_correct', 0)
+        session_percentage = (session_correct / session_total * 100) if session_total > 0 else 0
+
+        # Находим номер темы для callback_data
+        topic_num = topics_list.index(topic) if topic in topics_list else 0
+
+        # Получаем общее количество вопросов
+        if topic == "🎲 Все темы (рандом)":
+            total_questions = sum(len(q) for q in questions_by_topic.values())
+        else:
+            total_questions = len(questions_by_topic.get(topic, []))
+
+        # Формируем сообщение о завершении темы
+        completion_text = f"""
+🎉 <b>Поздравляем!</b>
+
+📚 <b>Тема завершена:</b> {topic}
+
+✅ Вы ответили правильно на все вопросы в этой теме!
+📊 <b>Всего вопросов:</b> {total_questions}
+
+📈 <b>Статистика сессии:</b>
+• Правильных ответов: {session_correct}/{session_total}
+• Процент правильных: {session_percentage:.1f}%
+
+Выберите другую тему или начните новую сессию.
+"""
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📚 Выбрать тему", callback_data="change_topic"))
+        markup.add(types.InlineKeyboardButton("🔄 Начать новую сессию", callback_data=f"r_{topic_num}"))
+        markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
         if message_id:
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"❌ Не удалось получить вопрос из темы '{topic}'.",
-                reply_markup=create_back_button("change_topic")
+                text=completion_text,
+                parse_mode='HTML',
+                reply_markup=markup
             )
         else:
             bot.send_message(
                 chat_id,
-                f"❌ Не удалось получить вопрос из темы '{topic}'.",
-                reply_markup=create_back_button("change_topic")
+                completion_text,
+                parse_mode='HTML',
+                reply_markup=markup
             )
         return
-
-    # Сохраняем данные вопроса
-    user_data[chat_id]['current_question'] = question_data['question']
-    user_data[chat_id]['correct_answer'] = None
-    user_data[chat_id]['numbered_answers'] = {}
-    user_data[chat_id]['answers_list'] = []
-
     # Извлекаем правильные ответы
     correct_answers = []
     for answer in question_data['answers']:
         if answer['correct']:
             correct_answers.append(answer['text'])
 
-    user_data[chat_id]['correct_answer'] = correct_answers
-
     # Перемешиваем ответы
     answers = question_data['answers'].copy()
     random.shuffle(answers)
 
-    # Сохраняем список ответов для отображения
-    answers_texts = []
+    # Сохраняем данные вопроса через менеджер
+    numbered_answers = {}
+    answers_list = []
     for i, answer in enumerate(answers, 1):
         answer_text = answer['text']
-        answers_texts.append(f"{i}. {answer_text}")
-        user_data[chat_id]['numbered_answers'][i] = answer['text']
-        user_data[chat_id]['answers_list'].append(answer_text)
+        numbered_answers[i] = answer_text
+        answers_list.append(answer_text)
+
+    # Обновляем данные пользователя
+    user_data_manager.update_user_data(
+        chat_id,
+        current_question=question_data['question'],
+        current_question_full=question_data.get('full_question', ''),  # Полная строка с номером
+        current_question_number=question_data.get('number', ''),  # Номер вопроса
+        correct_answer=correct_answers,
+        numbered_answers=numbered_answers,
+        answers_list=answers_list,
+        current_question_topic=topic
+    )
 
     # Формируем текст вопроса
     topic_display = topic
     question_text = f"📚 <b>Тема:</b> {topic_display}\n\n"
 
+    # Добавляем информацию о прогрессе
+    user_data = user_data_manager.get_user_data(chat_id)
+    answered_questions = user_data.get('answered_questions', {}).get(topic, [])
+
+    if topic == "🎲 Все темы (рандом)":
+        total_questions = sum(len(q) for q in questions_by_topic.values())
+    else:
+        total_questions = len(questions_by_topic.get(topic, []))
+
+    answered_count = len(answered_questions)
+    progress_percentage = (answered_count / total_questions * 100) if total_questions > 0 else 0
+
+    question_text += f"📊 <b>Прогресс:</b> {answered_count}/{total_questions} ({progress_percentage:.1f}%)\n\n"
+
     # Добавляем статистику сессии если есть
-    if chat_id in session_stats and session_stats[chat_id]['session_total'] > 0:
-        session_total = session_stats[chat_id]['session_total']
-        session_correct = session_stats[chat_id]['session_correct']
+    session_stats_data = user_data_manager.get_session_stats(chat_id)
+    if session_stats_data['session_total'] > 0:
+        session_total = session_stats_data['session_total']
+        session_correct = session_stats_data['session_correct']
         session_percentage = (session_correct / session_total * 100) if session_total > 0 else 0
         question_text += f"📊 <b>Сессия:</b> {session_correct}/{session_total} ({session_percentage:.1f}%)\n\n"
 
-    # Форматируем текст вопроса
+    # Формируем текст вопроса с номером
     q_text = question_data['question']
-    # Удаляем лишние пробелы и дубликаты
-    q_text = ' '.join(q_text.split())
-    question_text += f"❓ <b>Вопрос:</b>\n{q_text}\n\n"
+    q_number = question_data.get('number', '')
+
+    if q_number:
+        question_text += f"❓ <b>Вопрос #{q_number}:</b>\n{q_text}\n\n"
+    else:
+        question_text += f"❓ <b>Вопрос:</b>\n{q_text}\n\n"
 
     # Добавляем варианты ответов
     question_text += "📋 <b>Варианты ответов:</b>\n"
-    for answer_line in answers_texts:
-        question_text += f"{answer_line}\n"
+    for i in range(1, len(answers) + 1):
+        question_text += f"{i}. {numbered_answers[i]}\n"
 
     question_text += "\n👇 Выберите номер правильного ответа:"
 
@@ -1524,7 +2372,7 @@ def send_question_inline(chat_id, message_id=None):
                 reply_markup=markup
             )
     except Exception as e:
-        print(f"❌ Ошибка при отправке вопроса: {e}")
+        logger.error(f"❌ Ошибка при отправке вопроса: {e}")
         # Если не удалось редактировать сообщение, отправляем новое
         bot.send_message(
             chat_id,
@@ -1788,7 +2636,7 @@ def handle_reset_stats(message):
 
 @bot.message_handler(commands=['grant_sub'])
 def handle_grant_sub(message):
-    """Выдача подписки пользователю"""
+    """Выдача подписки пользователю с валидацией"""
     chat_id = message.chat.id
     user = db.get_user(chat_id)
 
@@ -1799,22 +2647,28 @@ def handle_grant_sub(message):
     try:
         parts = message.text.split()
         if len(parts) < 2:
-            bot.send_message(chat_id, "❌ Использование: /grant_sub <user_id> [days=30]")
+            bot.send_message(chat_id,
+                             "❌ Использование: /grant_sub <user_id> [days=30]\n\n"
+                             "Примеры:\n"
+                             "/grant_sub 123456789\n"
+                             "/grant_sub 123456789 90")
             return
 
-        target_id = int(parts[1])
-        days = 30 if len(parts) < 3 else int(parts[2])
+        # ВАЛИДАЦИЯ
+        target_id = validate_user_id(parts[1])
+        days = 30 if len(parts) < 3 else validate_days(parts[2])
 
         if db.grant_subscription(target_id, days):
-            bot.send_message(chat_id, f"✅ Пользователю {target_id} выдана подписка на {days} дней")
+            bot.send_message(chat_id,
+                             f"✅ Пользователю {target_id} выдана подписка на {days} дней")
         else:
-            bot.send_message(chat_id, f"❌ Не удалось выдать подписку пользователю {target_id}")
+            bot.send_message(chat_id,
+                             f"❌ Не удалось выдать подписку пользователю {target_id}")
 
-    except ValueError:
-        bot.send_message(chat_id, "❌ Неверный формат данных")
+    except ValueError as e:
+        bot.send_message(chat_id, f"❌ Ошибка валидации: {e}")
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка: {e}")
-
 
 @bot.message_handler(commands=['checkmypayment'])
 def handle_check_my_payment(message):
@@ -1860,7 +2714,6 @@ def handle_check_my_payment(message):
 
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка: {e}")
-
 
 @bot.message_handler(commands=['extend_sub'])
 def handle_extend_sub(message):
@@ -1984,6 +2837,53 @@ def handle_set_admin(message):
         bot.send_message(chat_id, f"❌ Ошибка: {e}")
 
 
+@bot.message_handler(commands=['check_sub_sync'])
+def handle_check_sub_sync(message):
+    """Ручная проверка синхронизации подписок"""
+    chat_id = message.chat.id
+    user = db.get_user(chat_id)
+
+    if not user or not user.get('is_admin'):
+        bot.send_message(chat_id, "❌ У вас нет прав для этой команды.")
+        return
+
+    bot.send_message(chat_id, "🔄 Запускаю проверку синхронизации подписок...")
+
+    try:
+        # Проверка согласованности
+        problems = check_subscription_consistency()
+
+        # Синхронизация
+        result = sync_paid_subscriptions_on_startup()
+
+        # Формируем отчет
+        report = f"📊 <b>Результаты синхронизации:</b>\n\n"
+        report += f"✅ Всего платежей: {result.get('total', 0)}\n"
+        report += f"✅ Активировано подписок: {result.get('activated', 0)}\n"
+        report += f"⏩ Пропущено: {result.get('skipped', 0)}\n"
+        report += f"❌ Ошибок: {result.get('errors', 0)}\n"
+
+        # Используем get() с значением по умолчанию
+        report += f"⏰ Проверялись платежи за: {result.get('max_days', 3)} дня\n\n"
+
+        if 'error' in result:
+            report += f"⚠️ <b>Сообщение об ошибке:</b>\n{result['error'][:200]}\n\n"
+
+        if problems:
+            report += f"⚠️ <b>Проблемы согласованности:</b> {len(problems)}\n"
+            for i, problem in enumerate(problems[:3], 1):
+                report += f"{i}. {problem[:100]}...\n"
+            if len(problems) > 3:
+                report += f"... и еще {len(problems) - 3} проблем\n"
+        else:
+            report += "✅ <b>Проблем с согласованностью не найдено</b>"
+
+        bot.send_message(chat_id, report, parse_mode='HTML')
+
+    except Exception as e:
+        error_msg = f"❌ Ошибка выполнения команды /check_sub_sync: {e}"
+        bot.send_message(chat_id, error_msg)
+        logger.error(error_msg)
 
 def main_menu_callback(call):
     """Обработчик главного меню"""
@@ -2003,8 +2903,7 @@ def main_menu_callback(call):
         parse_mode='HTML',
         reply_markup=create_main_menu()
     )
-    bot.answer_callback_query(call.id)
-
+    answer_callback_safe(bot, call.id)
 
 def random_question_callback(call):
     """Обработчик случайного вопроса"""
@@ -2013,24 +2912,22 @@ def random_question_callback(call):
 
     # Проверяем доступ
     if not check_user_access(chat_id, send_message=False):
-        bot.answer_callback_query(call.id, "❌ Требуется активная подписка!")
+        answer_callback_safe(bot, call.id, "❌ Требуется активная подписка!")
         return
 
-    # Устанавливаем тему "Все темы"
-    if chat_id not in user_data:
-        user_data[chat_id] = {}
-
-    user_data[chat_id]['current_topic'] = "🎲 Все темы (рандом)"
-    user_data[chat_id]['current_question'] = None
-    user_data[chat_id]['correct_answer'] = None
-    user_data[chat_id]['numbered_answers'] = {}
-    user_data[chat_id]['answers_list'] = []
+    # Устанавливаем тему "Все темы" через менеджер
+    user_data_manager.update_user_data(
+        chat_id,
+        current_topic="🎲 Все темы (рандом)",
+        current_question=None,
+        correct_answer=None,
+        numbered_answers={},
+        answers_list=[]
+    )
 
     # Отправляем вопрос
-    bot.answer_callback_query(call.id, "🎲 Загружаю случайный вопрос...")
-
+    answer_callback_safe(bot, call.id, "🎲 Загружаю случайный вопрос...")
     send_question_inline(chat_id, message_id)
-
 
 def show_stats_callback(call):
     """Обработчик показа статистики"""
@@ -2039,38 +2936,60 @@ def show_stats_callback(call):
 
     # Проверяем доступ
     if not check_user_access(chat_id, send_message=False):
-        bot.answer_callback_query(call.id, "❌ Требуется активная подписка!")
+        answer_callback_safe(bot, call.id, "❌ Требуется активная подписка!")
         return
 
     show_stats_message(chat_id, message_id)
 
 
 def change_topic_callback(call):
-    """Обработчик смены темы"""
+    """Обработчик смены темы с отображением прогресса"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
     # Проверяем доступ
     if not check_user_access(chat_id, send_message=False):
-        bot.answer_callback_query(call.id, "❌ Требуется активная подписка!")
+        answer_callback_safe(bot, call.id, "❌ Требуется активная подписка!")
         return
 
     # Формируем текст со списком тем
     topics_text = "📚 <b>ДОСТУПНЫЕ ТЕМЫ:</b>\n\n"
+
+    # Получаем данные пользователя для отображения прогресса
+    user_data = user_data_manager.get_user_data(chat_id)
+    user_answered = user_data.get('answered_questions', {})
+
     for i, topic in enumerate(topics_list, 1):
-        topics_text += f"{i}. {topic}\n"
+        # Определяем общее количество вопросов
+        if topic == "🎲 Все темы (рандом)":
+            total_questions = sum(len(q) for q in questions_by_topic.values())
+        else:
+            total_questions = len(questions_by_topic.get(topic, []))
+
+        # Получаем количество отвеченных
+        answered_count = len(user_answered.get(topic, []))
+
+        # Формируем строку с прогрессом
+        if total_questions > 0:
+            progress_percentage = (answered_count / total_questions * 100)
+            progress_text = f" ({answered_count}/{total_questions} - {progress_percentage:.1f}%)"
+        else:
+            progress_text = ""
+
+        topics_text += f"{i}. {topic}{progress_text}\n"
 
     topics_text += "\n👇 Выберите номер темы:"
 
     # Создаем inline клавиатуру
     markup = types.InlineKeyboardMarkup(row_width=5)
 
-    # Кнопки с номерами тем
+    # Кнопки с номерами тем (индекс начинается с 0)
     buttons = []
-    for i in range(1, len(topics_list) + 1):
+    for i in range(len(topics_list)):
+        button_text = str(i + 1)  # Для отображения начинаем с 1
         buttons.append(types.InlineKeyboardButton(
-            text=str(i),
-            callback_data=f"topic_{i - 1}"
+            text=button_text,
+            callback_data=f"t_{i}"  # Упрощенный формат: t_0, t_1 и т.д.
         ))
 
     # Добавляем кнопки по 5 в ряд
@@ -2079,14 +2998,18 @@ def change_topic_callback(call):
 
     markup.row(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
 
-    bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=message_id,
-        text=topics_text,
-        parse_mode='HTML',
-        reply_markup=markup
-    )
-    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=topics_text,
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+        answer_callback_safe(bot, call.id)
+    except Exception as e:
+        logger.error(f"Ошибка при изменении сообщения: {e}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка обновления меню")
 
 
 def get_question_callback(call):
@@ -2096,13 +3019,13 @@ def get_question_callback(call):
 
     # Проверяем доступ
     if not check_user_access(chat_id, send_message=False):
-        bot.answer_callback_query(call.id, "❌ Требуется активная подписка!")
+        answer_callback_safe(bot, call.id, "❌ Требуется активная подписка!")
         return
 
     # Удаляем ответ на callback, чтобы не было двойных сообщений
-    bot.answer_callback_query(call.id, "🔄 Загружаю вопрос...")
+    answer_callback_safe(bot, call.id, "🔄 Загружаю вопрос...")
 
-
+    # Отправляем вопрос
     send_question_inline(chat_id, message_id)
 
 def subscribe_info_callback(call):
@@ -2166,7 +3089,7 @@ def subscribe_info_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def subscribe_callback(call):
     """Обработчик оформления подписки - одна цена"""
@@ -2195,7 +3118,7 @@ def subscribe_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def pay_now_callback(call):
     """Обработчик оплаты"""
@@ -2215,10 +3138,10 @@ def pay_now_callback(call):
             parse_mode='HTML',
             reply_markup=markup
         )
-        bot.answer_callback_query(call.id, "❌ Система оплаты недоступна")
+        answer_callback_safe(bot, call.id, "❌ Система оплаты недоступна")
         return
 
-    bot.answer_callback_query(call.id, "🔄 Создаю платеж...")
+    answer_callback_safe(bot, call.id, "🔄 Создаю платеж...")
 
     # Создаем платеж
     payment_info = create_yookassa_payment(chat_id)
@@ -2289,7 +3212,7 @@ def trial_callback(call):
                         parse_mode='HTML',
                         reply_markup=markup
                     )
-                    bot.answer_callback_query(call.id, "❌ Пробный доступ уже был использован!")
+                    answer_callback_safe(bot, call.id, "❌ Пробный доступ уже был использован!")
                     return
             except:
                 pass
@@ -2305,7 +3228,7 @@ def trial_callback(call):
             parse_mode='HTML',
             reply_markup=markup
         )
-        bot.answer_callback_query(call.id, "❌ Пробный доступ уже был использован!")
+        answer_callback_safe(bot, call.id, "❌ Пробный доступ уже был использован!")
         return
 
     # Даем пробный доступ на 1 день от текущего момента
@@ -2317,12 +3240,18 @@ def trial_callback(call):
             current_end = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
             if current_end > datetime.now():
                 # Уже есть активная подписка
-                bot.answer_callback_query(call.id, "✅ У вас уже есть активная подписка!")
+                answer_callback_safe(bot, call.id, "✅ У вас уже есть активная подписка!")
                 return
         except:
             pass
 
-    db.update_subscription(chat_id, True, end_datetime, is_trial=True)
+    db.update_subscription(
+        telegram_id=chat_id,
+        paid_status=True,
+        end_datetime=end_datetime,
+        is_trial=True,
+        is_purchased=False
+    )
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🚀 Начать обучение", callback_data="main_menu"))
@@ -2336,7 +3265,7 @@ def trial_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id, "✅ Пробный доступ активирован!")
+    answer_callback_safe(bot, call.id, "✅ Пробный доступ активирован!")
 
 def info_callback(call):
     """Обработчик информации о боте"""
@@ -2347,8 +3276,12 @@ def info_callback(call):
 ℹ️ <b>Информация о боте</b>
 
 🤖 <b>Бот для подготовки к тестам</b>
-Версия: 1.0
-
+Версия: 1.2
+❓<b>Обновление от 11.02.2026 что нового?</b>
+• Обновлена система отправки вопросов.
+• Увеличена стабильность системы.
+• Появилась более точная статистика.
+• Появилась возможность обнулять статистику.
 📚 <b>Загружено:</b>
 • Тем: {len(topics_list) - 1 if topics_list else 0}
 • Вопросов: {sum(len(q) for q in questions_by_topic.values()) if questions_by_topic else 0}
@@ -2364,7 +3297,7 @@ def info_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def help_menu_callback(call):
     """Обработчик помощи"""
@@ -2407,7 +3340,7 @@ def help_menu_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def check_questions_callback(call):
     """Обработчик проверки вопросов"""
@@ -2431,11 +3364,16 @@ def check_questions_callback(call):
             text="❌ Не удалось загрузить вопросы.",
             reply_markup=create_back_button("main_menu")
         )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
+
 
 def show_stats_message(chat_id, message_id=None):
-    """Показать статистику пользователя - ДОБАВЬТЕ ЭТУ ФУНКЦИЮ"""
+    """Показать статистику пользователя с прогрессом по темам"""
     stats = db.get_user_statistics(chat_id)
+    user_data = user_data_manager.get_user_data(chat_id)
+
+    # Получаем отвеченные вопросы
+    user_answered = user_data.get('answered_questions', {})
 
     if not stats or stats['total_answers'] == 0:
         stats_text = "📊 Статистика еще не собрана. Начните отвечать на вопросы!"
@@ -2444,9 +3382,10 @@ def show_stats_message(chat_id, message_id=None):
         correct_answers = stats['correct_answers']
         correct_percentage = (correct_answers / total_answers) * 100
 
-        # Получаем статистику сессии
-        session_total = session_stats.get(chat_id, {}).get('session_total', 0)
-        session_correct = session_stats.get(chat_id, {}).get('session_correct', 0)
+        # Получаем статистику сессии через менеджер
+        session_stats_data = user_data_manager.get_session_stats(chat_id)
+        session_total = session_stats_data.get('session_total', 0)
+        session_correct = session_stats_data.get('session_correct', 0)
         session_percentage = (session_correct / session_total * 100) if session_total > 0 else 0
 
         stats_text = f"""
@@ -2459,14 +3398,29 @@ def show_stats_message(chat_id, message_id=None):
 
 📊 <b>Статистика сессии:</b>
 ✅ Правильных: {session_correct}/{session_total} ({session_percentage:.1f}%)
+
+📚 <b>Прогресс по темам:</b>
 """
 
-    markup = types.InlineKeyboardMarkup()
+        # Добавляем прогресс по каждой теме
+        for topic in topics_list:
+            if topic == "🎲 Все темы (рандом)":
+                total_questions = sum(len(q) for q in questions_by_topic.values())
+            else:
+                total_questions = len(questions_by_topic.get(topic, []))
+
+            if total_questions > 0:
+                answered_count = len(user_answered.get(topic, []))
+                progress_percentage = (answered_count / total_questions * 100) if total_questions > 0 else 0
+                stats_text += f"\n• {topic}: {answered_count}/{total_questions} ({progress_percentage:.1f}%)"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton("🏆 Топ игроков", callback_data="top_players"))
 
-    if user_data.get(chat_id, {}).get('current_topic'):
+    # Проверяем наличие темы
+    if user_data.get('current_topic'):
         markup.add(
-            types.InlineKeyboardButton("🎲 Продолжить тренировку", callback_data="get_question"),
+            types.InlineKeyboardButton("🎲 Продолжить", callback_data="get_question"),
             types.InlineKeyboardButton("📚 Сменить тему", callback_data="change_topic")
         )
     else:
@@ -2475,8 +3429,11 @@ def show_stats_message(chat_id, message_id=None):
             types.InlineKeyboardButton("🎲 Случайный вопрос", callback_data="random_question")
         )
 
-    markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
-
+    # 🔥 НОВАЯ КНОПКА СБРОСА СТАТИСТИКИ
+    markup.add(
+        types.InlineKeyboardButton("🔄 Сбросить мою статистику", callback_data="reset_my_stats"),
+        types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
+    )
     if message_id:
         bot.edit_message_text(
             chat_id=chat_id,
@@ -2493,13 +3450,108 @@ def show_stats_message(chat_id, message_id=None):
             reply_markup=markup
         )
 
+
+def reset_my_stats_callback(call):
+    """Сброс статистики пользователем с подтверждением"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    if call.data == "reset_my_stats":
+        # Запрашиваем подтверждение
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("✅ Да, сбросить всё", callback_data="confirm_reset_stats"),
+            types.InlineKeyboardButton("❌ Нет, отмена", callback_data="show_stats")
+        )
+
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⚠️ <b>ПОДТВЕРДИТЕ СБРОС СТАТИСТИКИ</b>\n\n"
+                     "Вы уверены, что хотите сбросить всю свою статистику?\n\n"
+                     "• Обнулятся все правильные/неправильные ответы\n"
+                     "• Сбросится прогресс по всем темам\n"
+                     "• Очистится статистика сессии\n\n"
+                     "<b>Это действие необратимо!</b>",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        except Exception as e:
+            bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ <b>ПОДТВЕРДИТЕ СБРОС СТАТИСТИКИ</b>\n\n"
+                     "Вы уверены, что хотите сбросить всю свою статистику?\n\n"
+                     "• Обнулятся все правильные/неправильные ответы\n"
+                     "• Сбросится прогресс по всем темам\n"
+                     "• Очистится статистика сессии\n\n"
+                     "<b>Это действие необратимо!</b>",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        answer_callback_safe(bot, call.id)
+
+    elif call.data == "confirm_reset_stats":
+        # Выполняем сброс статистики
+        success = db.reset_user_statistics(chat_id)
+
+        # Полностью очищаем все данные пользователя в менеджере
+        user_data_manager.clear_user_data(chat_id)
+
+        # Сбрасываем answered_questions и session_questions
+        user_data = user_data_manager.get_user_data(chat_id)
+        user_data['answered_questions'] = {}
+        user_data['session_questions'] = {}
+
+        # Сбрасываем статистику сессии
+        session_stats = user_data_manager.get_session_stats(chat_id)
+        session_stats['session_total'] = 0
+        session_stats['session_correct'] = 0
+
+        if success:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("📚 Выбрать тему", callback_data="change_topic"),
+                types.InlineKeyboardButton("🎲 Случайный вопрос", callback_data="random_question")
+            )
+            markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="✅ <b>Статистика успешно сброшена!</b>\n\n"
+                         "Теперь вы можете начать обучение с чистого листа.",
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+            except:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="✅ <b>Статистика успешно сброшена!</b>\n\n"
+                         "Теперь вы можете начать обучение с чистого листа.",
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+
+            logger.info(f"👤 Пользователь {chat_id} сбросил свою статистику")
+            answer_callback_safe(bot, call.id, "✅ Статистика сброшена!")
+        else:
+            bot.send_message(
+                chat_id=chat_id,
+                text="❌ <b>Ошибка при сбросе статистики</b>\n\n"
+                     "Пожалуйста, попробуйте позже или обратитесь в поддержку.",
+                parse_mode='HTML'
+            )
+            answer_callback_safe(bot, call.id, "❌ Ошибка сброса")
+
 def admin_broadcast_callback(call):
     """Массовая рассылка через админ-панель"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
     # Сохраняем состояние пользователя
-    user_broadcast_states[chat_id] = {
+    user_data_manager.broadcast_states[chat_id] = {
         'state': 'waiting_for_message',
         'message': None,
         'confirmed': False
@@ -2518,8 +3570,7 @@ def admin_broadcast_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
-
+    answer_callback_safe(bot, call.id)
 
 def admin_extend_sub_callback(call):
     """Меню продления подписки"""
@@ -2541,8 +3592,7 @@ def admin_extend_sub_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
-
+    answer_callback_safe(bot, call.id)
 
 def extend_user_menu_callback(call):
     """Меню продления подписки конкретному пользователю"""
@@ -2550,7 +3600,7 @@ def extend_user_menu_callback(call):
     message_id = call.message.message_id
 
     # Сохраняем состояние
-    user_extend_states[chat_id] = {
+    user_data_manager.extend_states[chat_id] = {
         'state': 'waiting_for_user_id',
         'action': 'extend_user',
         'user_id': None,
@@ -2569,8 +3619,7 @@ def extend_user_menu_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
-
+    answer_callback_safe(bot, call.id)
 
 def extend_all_menu_callback(call):
     """Меню продления подписки всем активным пользователям"""
@@ -2609,7 +3658,10 @@ def extend_all_menu_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
+
+
+
 
 
 def handle_extend_all_callback(call):
@@ -2618,15 +3670,20 @@ def handle_extend_all_callback(call):
     message_id = call.message.message_id
 
     try:
-        # Парсим данные из callback (формат: extend_all_[тип]_[значение])
+        # Парсим данные из callback (формат: extend_all_hours_1 или extend_all_days_1)
         parts = call.data.split('_')
 
+        # Проверяем формат
         if len(parts) < 4:
-            bot.answer_callback_query(call.id, "❌ Неверный формат команды")
+            logger.error(f"❌ Неверный формат callback: {call.data}")
+            answer_callback_safe(bot, call.id, "❌ Неверный формат команды")
             return
 
+        # Определяем тип и значение
         time_type = parts[2]  # hours или days
         value = int(parts[3])  # значение
+
+        logger.info(f"📊 Продление всем: тип={time_type}, значение={value}")
 
         # Устанавливаем часы и дни
         hours = value if time_type == 'hours' else 0
@@ -2634,7 +3691,9 @@ def handle_extend_all_callback(call):
 
         # Создаем подтверждающее сообщение
         time_text = ""
-        if hours > 0:
+        if hours > 0 and days > 0:
+            time_text = f"{hours} час(ов) и {days} день(ей)"
+        elif hours > 0:
             time_text = f"{hours} час(ов)"
         elif days > 0:
             time_text = f"{days} день(ей)"
@@ -2643,7 +3702,7 @@ def handle_extend_all_callback(call):
         markup.add(
             types.InlineKeyboardButton(f"✅ Да, продлить на {time_text}",
                                        callback_data=f"confirm_extend_all_{hours}_{days}"),
-            types.InlineKeyboardButton("❌ Нет, отмена", callback_data="extend_all_menu")
+            types.InlineKeyboardButton("❌ Нет, отмена", callback_data="admin_extend_sub")
         )
 
         # Получаем статистику активных пользователей
@@ -2659,11 +3718,15 @@ def handle_extend_all_callback(call):
             parse_mode='HTML',
             reply_markup=markup
         )
-        bot.answer_callback_query(call.id)
+        answer_callback_safe(bot, call.id, f"⏳ Продление на {time_text}...")
 
+    except ValueError as e:
+        logger.error(f"❌ Ошибка преобразования значения: {e}, callback: {call.data}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка в значении срока")
     except Exception as e:
-        logger.error(f"Ошибка в handle_extend_all_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка обработки запроса")
+        logger.error(f"❌ Ошибка в handle_extend_all_callback: {e}")
+        logger.error(traceback.format_exc())
+        answer_callback_safe(bot, call.id, "❌ Ошибка обработки запроса")
 
 
 def handle_confirm_extend_callback(call):
@@ -2674,116 +3737,100 @@ def handle_confirm_extend_callback(call):
     try:
         if call.data.startswith("confirm_extend_all_"):
             # Продление всем
-            _, _, _, hours_str, days_str = call.data.split('_')
-            hours = int(hours_str)
-            days = int(days_str)
+            parts = call.data.split('_')
+            # confirm_extend_all_1_0 -> ['confirm', 'extend', 'all', '1', '0']
+            hours = int(parts[3]) if len(parts) >= 4 else 0
+            days = int(parts[4]) if len(parts) >= 5 else 0
 
-            bot.answer_callback_query(call.id, "⏳ Продлеваю подписки...")
+            answer_callback_safe(bot, call.id, "⏳ Продлеваю подписки...")
+            logger.info(f"🚀 ЗАПУСК ПРОДЛЕНИЯ ВСЕМ: +{days} дней, +{hours} часов")
 
-            # Выполняем продление
             result = db.extend_all_active_subscriptions(hours=hours, days=days)
 
-            # Формируем отчет
-            time_text = ""
-            if hours > 0 and days > 0:
-                time_text = f"{hours} час(ов) и {days} день(ей)"
-            elif hours > 0:
-                time_text = f"{hours} час(ов)"
-            elif days > 0:
-                time_text = f"{days} день(ей)"
+            time_text = f"{days} дн. {hours} ч." if days > 0 or hours > 0 else "0 часов 0 дней"
 
             report = f"✅ <b>Продление завершено!</b>\n\n"
             report += f"📅 Срок: {time_text}\n"
-            report += f"👥 Всего пользователей: {result['total']}\n"
-            report += f"✅ Успешно: {result['success']}\n"
-            report += f"❌ Ошибок: {result['failed']}\n"
-
-            if result['errors']:
-                report += f"\n📝 Ошибки (первые 5):\n"
-                for error in result['errors'][:5]:
-                    report += f"• {error}\n"
-                if len(result['errors']) > 5:
-                    report += f"... и еще {len(result['errors']) - 5} ошибок"
-
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("↩️ Назад к продлению", callback_data="admin_extend_sub"))
-
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=report,
-                parse_mode='HTML',
-                reply_markup=markup
-            )
+            report += f"👥 Всего пользователей: {result.get('total', 0)}\n"
+            report += f"✅ Успешно: {result.get('success', 0)}\n"
+            report += f"❌ Ошибок: {result.get('failed', 0)}\n"
 
         elif call.data.startswith("confirm_extend_user_"):
             # Продление конкретному пользователю
+            # Формат: confirm_extend_user_123456789_1_0
             parts = call.data.split('_')
-            user_id = int(parts[3])
-            hours = int(parts[4])
-            days = int(parts[5])
+            # ['confirm', 'extend', 'user', '123456789', '1', '0']
+            if len(parts) >= 6:
+                user_id = int(parts[3])
+                hours = int(parts[4])
+                days = int(parts[5])
 
-            bot.answer_callback_query(call.id, "⏳ Продлеваю подписку...")
+                answer_callback_safe(bot, call.id, "⏳ Продлеваю подписку...")
 
-            # Выполняем продление
-            if db.extend_subscription(user_id, hours=hours, days=days):
-                time_text = ""
-                if hours > 0 and days > 0:
-                    time_text = f"{hours} час(ов) и {days} день(ей)"
-                elif hours > 0:
-                    time_text = f"{hours} час(ов)"
-                elif days > 0:
-                    time_text = f"{days} день(ей)"
+                # Выполняем продление
+                if db.extend_subscription(user_id, hours=hours, days=days):
+                    user_info = db.get_user(user_id)
+                    end_date = user_info.get('subscription_end_date', 'неизвестно')
+                    username = user_info.get('username', 'нет username')
 
-                # Получаем обновленную информацию о пользователе
-                user = db.get_user(user_id)
-                end_date = user.get('subscription_end_date', 'неизвестно')
+                    time_text = f"{days} дн. {hours} ч." if days > 0 or hours > 0 else "0 часов 0 дней"
 
-                report = f"✅ <b>Подписка продлена!</b>\n\n"
-                report += f"👤 Пользователь ID: {user_id}\n"
-                report += f"📅 Срок: {time_text}\n"
-                report += f"🕐 Действует до: {end_date}\n"
+                    report = f"✅ <b>Подписка продлена!</b>\n\n"
+                    report += f"👤 Пользователь ID: {user_id}\n"
+                    report += f"📱 Username: @{username}\n"
+                    report += f"📅 Срок: {time_text}\n"
+                    report += f"🕐 Действует до: {end_date}\n\n"
 
-                # Отправляем уведомление пользователю
-                try:
-                    notification = f"🎉 <b>Ваша подписка продлена!</b>\n\n"
-                    notification += f"Администратор продлил вашу подписку на {time_text}.\n"
-                    notification += f"Теперь она действует до: {end_date}"
-
-                    bot.send_message(user_id, notification, parse_mode='HTML')
-                except Exception as e:
-                    logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
-                    report += f"\n⚠️ Не удалось отправить уведомление пользователю"
-
+                    # Отправляем уведомление пользователю
+                    try:
+                        notification = f"🎉 <b>Ваша подписка продлена!</b>\n\n"
+                        notification += f"Администратор продлил вашу подписку на {time_text}.\n"
+                        notification += f"Теперь она действует до: {end_date}"
+                        bot.send_message(user_id, notification, parse_mode='HTML')
+                        report += f"✅ Уведомление отправлено пользователю"
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить уведомление {user_id}: {e}")
+                        report += f"⚠️ Не удалось отправить уведомление"
+                else:
+                    report = f"❌ <b>Не удалось продлить подписку</b>\n\nПользователь ID: {user_id}"
             else:
-                report = f"❌ <b>Не удалось продлить подписку</b>\n\n"
-                report += f"Пользователь ID: {user_id}\n"
-                report += f"Возможно, пользователь не найден или произошла ошибка."
+                report = "❌ <b>Ошибка формата данных</b>"
+        else:
+            return
 
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("↩️ Назад к продлению", callback_data="admin_extend_sub"))
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("↩️ Назад к продлению", callback_data="admin_extend_sub"))
+        markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
 
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=report,
-                parse_mode='HTML',
-                reply_markup=markup
-            )
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=report,
+            parse_mode='HTML',
+            reply_markup=markup
+        )
 
     except Exception as e:
-        logger.error(f"Ошибка в handle_confirm_extend_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка при продлении")
+        logger.error(f"❌ Ошибка в handle_confirm_extend_callback: {e}")
+        logger.error(traceback.format_exc())
+        answer_callback_safe(bot, call.id, "❌ Ошибка при продлении")
 
 def handle_admin_callback(call):
     """Обработка административных callback-запросов"""
     chat_id = call.message.chat.id
-    message_id = call.message.message_id
 
+    # ПРОВЕРКА ПРАВ В САМОМ НАЧАЛЕ
     user = db.get_user(chat_id)
     if not user or not user.get('is_admin'):
-        bot.answer_callback_query(call.id, "❌ Нет прав администратора!")
+        logger.warning(f"⚠️ Попытка доступа к админке от {chat_id} без прав")
+        try:
+            bot.answer_callback_query(call.id, "❌ У вас нет прав администратора!", show_alert=True)
+        except:
+            pass
         return
+
+    message_id = call.message.message_id
+    logger.info(f"👑 Админ callback: {call.data} от {chat_id}")
 
     if call.data == "admin_stats":
         admin_stats_callback(call)
@@ -2793,6 +3840,16 @@ def handle_admin_callback(call):
         admin_grant_sub_callback(call)
     elif call.data == "admin_extend_sub":
         admin_extend_sub_callback(call)
+    elif call.data == "extend_all_menu":
+        extend_all_menu_callback(call)
+    elif call.data == "extend_user_menu":
+        extend_user_menu_callback(call)
+    # Обработка всех вариантов продления для всех пользователей
+    elif call.data.startswith("extend_all_hours_") or call.data.startswith("extend_all_days_"):
+        handle_extend_all_callback(call)
+    # Обработка всех вариантов продления для конкретного пользователя
+    elif call.data.startswith("extend_user_"):
+        handle_extend_user_callback(call)
     elif call.data == "admin_grant_admin":
         admin_grant_admin_callback(call)
     elif call.data == "admin_broadcast":
@@ -2803,7 +3860,7 @@ def handle_admin_callback(call):
         admin_restart_callback(call)
     elif call.data == "admin_db":
         admin_db_callback(call)
-    elif call.data.startswith("confirm_extend_"):  # Подтверждение продления
+    elif call.data.startswith("confirm_extend_"):
         handle_confirm_extend_callback(call)
     elif call.data == "back_to_admin":
         back_to_admin_callback(call)
@@ -2820,7 +3877,8 @@ def handle_admin_callback(call):
     elif call.data == "restart_confirm":
         restart_confirm_callback(call)
     else:
-        bot.answer_callback_query(call.id, "❌ Неизвестная команда администратора")
+        logger.warning(f"⚠️ Неизвестный админ callback: {call.data}")
+        answer_callback_safe(bot, call.id, "❌ Неизвестная команда администратора")
 
 def admin_stats_callback(call):
     """Статистика системы"""
@@ -2857,7 +3915,7 @@ def admin_stats_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def admin_users_callback(call):
     """Список пользователей"""
@@ -2893,7 +3951,7 @@ def admin_users_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def admin_grant_sub_callback(call):
     """Выдача подписки"""
@@ -2911,7 +3969,7 @@ def admin_grant_sub_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def admin_grant_admin_callback(call):
     """Назначение администратора"""
@@ -2929,7 +3987,7 @@ def admin_grant_admin_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def admin_logs_callback(call):
     """Управление логами"""
@@ -2955,7 +4013,7 @@ def admin_logs_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def admin_restart_callback(call):
     """Перезагрузка бота"""
@@ -2975,7 +4033,7 @@ def admin_restart_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def back_to_admin_callback(call):
     """Назад в админку"""
@@ -3011,7 +4069,7 @@ def back_to_admin_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def top_players_callback(call):
     """Топ игроков"""
@@ -3046,7 +4104,7 @@ def top_players_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def subscription_terms_callback(call):
     """Условия подписки - упрощенные"""
@@ -3089,20 +4147,122 @@ def subscription_terms_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
 def check_payment_callback(call):
-    """Проверка статуса платежа (без вебхуков) - ИСПРАВЛЕННАЯ"""
+    """Проверка статуса платежа с улучшенной обработкой ошибок"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
-    payment_id = call.data.split('_')[2]
-
-    bot.answer_callback_query(call.id, "🔄 Проверяем статус оплаты...")
-
-    # Проверяем статус платежа
     try:
-        payment = Payment.find_one(payment_id)
+        # Извлекаем payment_id из callback данных
+        if not call.data or '_' not in call.data:
+            answer_callback_safe(bot, call.id, "❌ Ошибка в данных запроса")
+            return
+
+        parts = call.data.split('_')
+        if len(parts) < 3:
+            answer_callback_safe(bot, call.id, "❌ Неверный формат запроса")
+            return
+
+        payment_id = parts[2]
+
+        # ДОБАВЛЯЕМ ПРОВЕРКУ НАЛИЧИЯ payment_id
+        if not payment_id or len(payment_id) < 5:
+            answer_callback_safe(bot, call.id, "❌ Неверный ID платежа")
+            return
+
+        answer_callback_safe(bot, call.id, "🔄 Проверяем статус оплаты...")
+
+        # Проверяем статус платежа с таймаутом и обработкой ошибок
+        payment = None
+        try:
+            # Пробуем получить статус платежа с таймаутом
+            payment = Payment.find_one(payment_id, timeout=10)  # Таймаут 10 секунд
+        except yookassa.exceptions.ApiError as api_error:
+            logger.error(f"❌ Ошибка API ЮKassa: {api_error}")
+            # Показываем пользователю сообщение об ошибке API
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Попробовать снова",
+                                                  callback_data=f"check_payment_{payment_id}"))
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⚠️ <b>Временная проблема с платежной системой</b>\n\n"
+                     "Не удалось проверить статус платежа из-за ошибки в платежной системе.\n"
+                     "Попробуйте проверить статус позже или обратитесь в поддержку.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            return
+        except requests.exceptions.Timeout:
+            logger.error(f"❌ Таймаут при запросе статуса платежа {payment_id}")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Попробовать снова",
+                                                  callback_data=f"check_payment_{payment_id}"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⏱️ <b>Таймаут запроса</b>\n\n"
+                     "Платежная система не отвечает.\n"
+                     "Попробуйте проверить статус позже.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            return
+        except requests.exceptions.ConnectionError:
+            logger.error(f"❌ Ошибка соединения при проверке платежа {payment_id}")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Попробовать снова",
+                                                  callback_data=f"check_payment_{payment_id}"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="🔌 <b>Ошибка соединения</b>\n\n"
+                     "Нет подключения к платежной системе.\n"
+                     "Проверьте ваше интернет-соединение.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            return
+        except Exception as api_error:
+            logger.error(f"❌ Неизвестная ошибка при проверке платежа {payment_id}: {api_error}")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Попробовать снова",
+                                                  callback_data=f"check_payment_{payment_id}"))
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⚠️ <b>Неизвестная ошибка</b>\n\n"
+                     "Произошла непредвиденная ошибка при проверке платежа.\n"
+                     "Попробуйте позже или обратитесь в поддержку.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            return
+
+        # Если платеж не найден
+        if not payment:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💳 Попробовать снова", callback_data="pay_now"))
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="❌ <b>Платеж не найден</b>\n\n"
+                     "Не удалось найти информацию о платеже.\n"
+                     "Возможно, платеж был отменен или произошла ошибка при его создании.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            return
 
         # Обновляем статус в базе данных
         db.update_payment_status(payment_id, payment.status)
@@ -3124,7 +4284,7 @@ def check_payment_callback(call):
 
             if payment_data and payment_data['is_processed']:
                 # Платеж уже был обработан ранее
-                bot.answer_callback_query(call.id, "✅ Платеж уже был обработан ранее")
+                answer_callback_safe(bot, call.id, "✅ Платеж уже был обработан ранее")
 
                 # Просто показываем статус
                 user_info = db.get_user(chat_id)
@@ -3147,29 +4307,37 @@ def check_payment_callback(call):
                 return
 
             # Платеж успешен и еще не обработан
-            telegram_id = payment.metadata.get('telegram_id', chat_id)
+            telegram_id = payment.metadata.get('telegram_id') if hasattr(payment, 'metadata') else chat_id
 
-            # Проверяем, не была ли уже активирована подписка по этому платежу
+            # Улучшенная логика активации подписки
             user = db.get_user(telegram_id)
             if user and user.get('subscription_paid'):
                 # У пользователя уже есть активная подписка
-                # Продлеваем от текущей даты окончания
-                current_end = None
                 if user.get('subscription_end_date'):
                     try:
                         current_end = datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S')
+                        # Продлеваем от текущей даты окончания, если она в будущем
+                        if current_end > datetime.now():
+                            end_datetime = current_end + timedelta(days=30)
+                        else:
+                            # Иначе начинаем с текущего момента + 1 день (буфер)
+                            end_datetime = datetime.now() + timedelta(days=30)
                     except:
-                        current_end = datetime.now()
-
-                if current_end:
-                    end_datetime = current_end + timedelta(days=30)
+                        end_datetime = datetime.now() + timedelta(days=30)
                 else:
                     end_datetime = datetime.now() + timedelta(days=30)
             else:
-                # Активируем новую подписку на 30 дней
+                # Новая подписка
                 end_datetime = datetime.now() + timedelta(days=30)
 
-            db.update_subscription(telegram_id, True, end_datetime)
+            # Активируем подписку с пометкой о покупке
+            db.update_subscription(
+                telegram_id=telegram_id,
+                paid_status=True,
+                end_datetime=end_datetime,
+                is_trial=False,
+                is_purchased=True  # Указываем, что это купленная подписка
+            )
 
             # Помечаем платеж как обработанный
             db.mark_payment_processed(payment_id)
@@ -3203,7 +4371,27 @@ def check_payment_callback(call):
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text="⏳ <b>Оплата в обработке</b>\n\nПлатеж получен, но еще не подтвержден.\nПодождите 1-2 минуты и проверьте снова.",
+                text="⏳ <b>Оплата в обработке</b>\n\n"
+                     "Платеж получен, но еще не подтвержден банком.\n"
+                     "Подождите 1-2 минуты и проверьте снова.\n\n"
+                     "Если статус не меняется в течение 15 минут,\n"
+                     "обратитесь в поддержку.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+        elif payment.status == 'waiting_for_capture':
+            # Платеж ожидает подтверждения (захвата)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Проверить снова", callback_data=f"check_payment_{payment_id}"))
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⏳ <b>Ожидание подтверждения</b>\n\n"
+                     "Платеж авторизован, но ожидает подтверждения (захвата).\n"
+                     "Обычно это занимает несколько минут.",
                 parse_mode='HTML',
                 reply_markup=markup
             )
@@ -3217,48 +4405,87 @@ def check_payment_callback(call):
             status_text = {
                 'canceled': 'отменен',
                 'failed': 'не прошел',
-                'rejected': 'отклонен',
-                'waiting_for_capture': 'ожидает подтверждения'
+                'rejected': 'отклонен банком'
             }.get(payment.status, payment.status)
+
+            reason = ""
+            if hasattr(payment, 'cancellation_details') and payment.cancellation_details:
+                reason = f"\nПричина: {payment.cancellation_details.reason}"
 
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"❌ <b>Платеж {status_text}</b>\n\nПожалуйста, попробуйте снова или обратитесь в поддержку.",
+                text=f"❌ <b>Платеж {status_text}</b>\n\n"
+                     f"Платеж не был завершен успешно.{reason}\n\n"
+                     f"Пожалуйста, попробуйте снова или обратитесь в поддержку.",
                 parse_mode='HTML',
                 reply_markup=markup
             )
 
+    except IndexError:
+        logger.error(f"❌ Ошибка парсинга payment_id из callback: {call.data}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка в данных платежа")
     except Exception as e:
-        print(f"❌ Ошибка при проверке платежа: {e}")
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔄 Проверить снова", callback_data=f"check_payment_{payment_id}"))
-        markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+        logger.error(f"❌ Критическая ошибка в check_payment_callback: {e}")
+        logger.error(traceback.format_exc())
 
-        bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text="⚠️ <b>Не удалось проверить статус платежа</b>\n\nПожалуйста, попробуйте позже или обратитесь в поддержку.",
-            parse_mode='HTML',
-            reply_markup=markup
-        )
+        # Показываем общее сообщение об ошибке
+        try:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
 
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⚠️ <b>Произошла ошибка</b>\n\n"
+                     "При обработке платежа произошла непредвиденная ошибка.\n"
+                     "Пожалуйста, обратитесь в поддержку.",
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+        except:
+            pass
+        finally:
+            answer_callback_safe(bot, call.id, "❌ Произошла ошибка")
+
+def validate_user_id(user_id):
+    """Валидация ID пользователя"""
+    try:
+        user_id_int = int(user_id)
+        if user_id_int <= 0:
+            raise ValueError("ID должен быть положительным числом")
+        if user_id_int > 2**63 - 1:  # Максимальный для Telegram
+            raise ValueError("ID слишком большой")
+        return user_id_int
+    except (ValueError, TypeError):
+        raise ValueError(f"Некорректный ID пользователя: {user_id}")
+
+def validate_days(days):
+    """Валидация количества дней"""
+    try:
+        days_int = int(days)
+        if days_int < 0:
+            raise ValueError("Количество дней не может быть отрицательным")
+        if days_int > 3650:  # 10 лет максимум
+            raise ValueError("Слишком большой срок")
+        return days_int
+    except (ValueError, TypeError):
+        raise ValueError(f"Некорректное количество дней: {days}")
 
 # ============================================================================
 # МАССОВАЯ РАССЫЛКА СООБЩЕНИЙ ВСЕМ ПОЛЬЗОВАТЕЛЯМ
 # ============================================================================
 
 # Словарь для хранения состояний пользователей при массовой рассылке
-user_broadcast_states = {}
+user_data_manager.broadcast_states = {}
 
-
-# Добавьте обработчик сообщений
-@bot.message_handler(func=lambda message: message.chat.id in user_extend_states and
-                                          user_extend_states[message.chat.id]['state'] == 'waiting_for_user_id')
+@bot.message_handler(func=lambda message:
+    message.chat.id in user_data_manager.extend_states and
+    user_data_manager.extend_states[message.chat.id]['state'] == 'waiting_for_user_id')
 def handle_extend_user_id(message):
     """Обработка ввода ID пользователя для продления"""
     chat_id = message.chat.id
-    user_state = user_extend_states[chat_id]
+    user_state = user_data_manager.extend_states[chat_id]
 
     try:
         user_id = int(message.text.strip())
@@ -3278,7 +4505,7 @@ def handle_extend_user_id(message):
                 parse_mode='HTML',
                 reply_markup=markup
             )
-            del user_extend_states[chat_id]
+            del user_data_manager.extend_states[chat_id]
             return
 
         # Показываем информацию о пользователе
@@ -3322,7 +4549,7 @@ def handle_extend_user_id(message):
             reply_markup=markup
         )
 
-        del user_extend_states[chat_id]
+        del user_data_manager.extend_states[chat_id]
 
     except ValueError:
         markup = types.InlineKeyboardMarkup()
@@ -3336,13 +4563,12 @@ def handle_extend_user_id(message):
             parse_mode='HTML',
             reply_markup=markup
         )
-        del user_extend_states[chat_id]
+        del user_data_manager.extend_states[chat_id]
     except Exception as e:
         logger.error(f"Ошибка в handle_extend_user_id: {e}")
         bot.send_message(chat_id, f"❌ Ошибка: {e}")
-        if chat_id in user_extend_states:
-            del user_extend_states[chat_id]
-
+        if chat_id in user_data_manager.extend_states:
+            del user_data_manager.extend_states[chat_id]
 
 def handle_extend_user_callback(call):
     """Обработка выбора срока продления для конкретного пользователя"""
@@ -3354,7 +4580,7 @@ def handle_extend_user_callback(call):
         parts = call.data.split('_')
 
         if len(parts) < 5:
-            bot.answer_callback_query(call.id, "❌ Неверный формат команды")
+            answer_callback_safe(bot, call.id, "❌ Неверный формат команды")
             return
 
         user_id = int(parts[2])  # ID пользователя
@@ -3368,7 +4594,7 @@ def handle_extend_user_callback(call):
         # Получаем информацию о пользователе
         user_info = db.get_user(user_id)
         if not user_info:
-            bot.answer_callback_query(call.id, "❌ Пользователь не найден")
+            answer_callback_safe(bot, call.id, "❌ Пользователь не найден")
             return
 
         username = user_info.get('username', 'нет username')
@@ -3401,11 +4627,11 @@ def handle_extend_user_callback(call):
             parse_mode='HTML',
             reply_markup=markup
         )
-        bot.answer_callback_query(call.id)
+        answer_callback_safe(bot, call.id)
 
     except Exception as e:
         logger.error(f"Ошибка в handle_extend_user_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка обработки запроса")
+        answer_callback_safe(bot, call.id, "❌ Ошибка обработки запроса")
 
 @bot.message_handler(commands=['send_all_users'])
 def handle_send_all_users(call):
@@ -3415,11 +4641,11 @@ def handle_send_all_users(call):
     user = db.get_user(chat_id)
 
     if not user or not user.get('is_admin'):
-        bot.answer_callback_query(call.id, "❌ У вас нет прав администратора для этой команды.")
+        answer_callback_safe(bot, call.id, "❌ У вас нет прав администратора для этой команды.")
         return
 
     # Сохраняем состояние пользователя
-    user_broadcast_states[chat_id] = {
+    user_data_manager.broadcast_states[chat_id] = {
         'state': 'waiting_for_message',
         'message': None,
         'confirmed': False
@@ -3438,21 +4664,38 @@ def handle_send_all_users(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
-
-@bot.message_handler(func=lambda message: message.chat.id in user_broadcast_states and
-                                          user_broadcast_states[message.chat.id]['state'] == 'waiting_for_message')
+@bot.message_handler(func=lambda message: message.chat.id in user_data_manager.broadcast_states and
+                                          user_data_manager.broadcast_states[message.chat.id]['state'] == 'waiting_for_message')
 def handle_broadcast_message(message):
     """Обработка сообщения для рассылки"""
     chat_id = message.chat.id
-    user_state = user_broadcast_states[chat_id]
+
+    # Проверяем существование состояния
+    if chat_id not in user_data_manager.broadcast_states:
+        return
+
+    user_state = user_data_manager.broadcast_states[chat_id]
+
+    # БЕЗОПАСНОЕ извлечение текста
+    message_text = None
+    if message.text:
+        message_text = message.text
+    elif message.caption:
+        message_text = message.caption
+    elif message.content_type == 'text':
+        message_text = message.text
+    else:
+        # Для медиафайлов без подписи
+        message_text = "📎 [Медиафайл без подписи]"
 
     # Сохраняем сообщение
     user_state['state'] = 'waiting_for_confirmation'
-    user_state['message'] = message.text or message.caption
+    user_state['message'] = message_text
     user_state['message_type'] = message.content_type
     user_state['message_id'] = message.message_id
+    user_state['timestamp'] = time.time()  # Добавляем timestamp для очистки
 
     # Если есть фото/документ/другие медиафайлы
     if message.photo:
@@ -3538,35 +4781,34 @@ def handle_broadcast_message(message):
             f"❌ Ошибка при создании предпросмотра: {e}\n\nПопробуйте отправить сообщение еще раз.",
             parse_mode='HTML'
         )
-        user_broadcast_states[chat_id]['state'] = 'waiting_for_message'
+        user_data_manager.broadcast_states[chat_id]['state'] = 'waiting_for_message'
 
-
-@bot.callback_query_handler(func=lambda call: call.data in ['confirm_broadcast', 'edit_broadcast',
-                                                            'cancel_broadcast', 'broadcast_active_only'])
+#@bot.callback_query_handler(func=lambda call: call.data in ['confirm_broadcast', 'edit_broadcast',
+#                                                           'cancel_broadcast', 'broadcast_active_only'])
 def handle_broadcast_callback(call):
     """Обработка callback для массовой рассылки"""
     chat_id = call.message.chat.id
 
-    if chat_id not in user_broadcast_states:
-        bot.answer_callback_query(call.id, "❌ Сессия рассылки устарела")
+    if chat_id not in user_data_manager.broadcast_states:
+        answer_callback_safe(bot, call.id, "❌ Сессия рассылки устарела")
         return
 
-    user_state = user_broadcast_states[chat_id]
+    user_state = user_data_manager.broadcast_states[chat_id]
 
     if call.data == 'confirm_broadcast':
         # Подтверждение отправки всем пользователям
-        bot.answer_callback_query(call.id, "🚀 Начинаю рассылку...")
+        answer_callback_safe(bot, call.id, "🚀 Начинаю рассылку...")
         send_broadcast_to_all(chat_id, user_state, call.message.message_id, active_only=False)
 
     elif call.data == 'broadcast_active_only':
         # Отправка только активным пользователям
-        bot.answer_callback_query(call.id, "🚀 Начинаю рассылку активным пользователям...")
+        answer_callback_safe(bot, call.id, "🚀 Начинаю рассылку активным пользователям...")
         send_broadcast_to_all(chat_id, user_state, call.message.message_id, active_only=True)
 
     elif call.data == 'edit_broadcast':
         # Редактирование сообщения
-        bot.answer_callback_query(call.id, "✏️ Отправьте новое сообщение")
-        user_broadcast_states[chat_id]['state'] = 'waiting_for_message'
+        answer_callback_safe(bot, call.id, "✏️ Отправьте новое сообщение")
+        user_data_manager.broadcast_states[chat_id]['state'] = 'waiting_for_message'
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_broadcast"))
@@ -3584,9 +4826,9 @@ def handle_broadcast_callback(call):
 
     elif call.data == 'cancel_broadcast':
         # Отмена рассылки
-        bot.answer_callback_query(call.id, "❌ Рассылка отменена")
-        if chat_id in user_broadcast_states:
-            del user_broadcast_states[chat_id]
+        answer_callback_safe(bot, call.id, "❌ Рассылка отменена")
+        if chat_id in user_data_manager.broadcast_states:
+            del user_data_manager.broadcast_states[chat_id]
 
         bot.edit_message_text(
             chat_id=chat_id,
@@ -3594,7 +4836,6 @@ def handle_broadcast_callback(call):
             text="❌ <b>Рассылка отменена</b>",
             parse_mode='HTML'
         )
-
 
 def send_broadcast_to_all(admin_chat_id, broadcast_data, message_id, active_only=False):
     """Отправка рассылки всем пользователям"""
@@ -3731,8 +4972,8 @@ def send_broadcast_to_all(admin_chat_id, broadcast_data, message_id, active_only
         )
 
         # Очищаем состояние
-        if admin_chat_id in user_broadcast_states:
-            del user_broadcast_states[admin_chat_id]
+        if admin_chat_id in user_data_manager.broadcast_states:
+            del user_data_manager.broadcast_states[admin_chat_id]
 
         # Отправляем уведомление в лог-чат
         log_text = f"📢 Администратор {admin_chat_id} провел рассылку\n"
@@ -3748,130 +4989,63 @@ def send_broadcast_to_all(admin_chat_id, broadcast_data, message_id, active_only
         )
 
         # Очищаем состояние
-        if admin_chat_id in user_broadcast_states:
-            del user_broadcast_states[admin_chat_id]
-
-def select_topic_callback(call):
-    """Обработчик выбора темы"""
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-
-    # Проверяем доступ
-    if not check_user_access(chat_id, send_message=False):
-        bot.answer_callback_query(call.id, "❌ Требуется активная подписка!")
-        return
-
-    try:
-        topic_num = int(call.data.split('_')[1])
-
-        if 0 <= topic_num < len(topics_list):
-            selected_topic = topics_list[topic_num]
-
-            # Инициализируем данные пользователя если их нет
-            if chat_id not in user_data:
-                user_data[chat_id] = {}
-
-            # Сохраняем выбранную тему
-            user_data[chat_id]['current_topic'] = selected_topic
-            user_data[chat_id]['current_question'] = None
-            user_data[chat_id]['correct_answer'] = None
-            user_data[chat_id]['numbered_answers'] = {}
-            user_data[chat_id]['answers_list'] = []
-
-            # Получаем количество вопросов в теме
-            if selected_topic == "🎲 Все темы (рандом)":
-                topic_questions_count = sum(len(q) for q in questions_by_topic.values())
-            elif selected_topic in questions_by_topic:
-                topic_questions_count = len(questions_by_topic[selected_topic])
-            else:
-                topic_questions_count = 0
-
-            topic_info = f"""
-✅ <b>Выбрана тема:</b> {selected_topic}
-📊 <b>Вопросов в теме:</b> {topic_questions_count}
-
-👇 Выберите действие:
-            """
-
-            # Создаем кнопки
-            markup = types.InlineKeyboardMarkup()
-            markup.add(
-                types.InlineKeyboardButton("🎲 Получить вопрос", callback_data="get_question"),
-                types.InlineKeyboardButton("📊 Показать статистику", callback_data="show_stats")
-            )
-            markup.add(
-                types.InlineKeyboardButton("🔄 Выбрать другую тему", callback_data="change_topic"),
-                types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
-            )
-
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=topic_info,
-                parse_mode='HTML',
-                reply_markup=markup
-            )
-
-            bot.answer_callback_query(call.id, f"Выбрана тема: {selected_topic}")
-        else:
-            bot.answer_callback_query(call.id, "❌ Неверный номер темы.")
-
-    except (ValueError, IndexError) as e:
-        print(f"❌ Ошибка выбора темы: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка при выборе темы.")
+        if admin_chat_id in user_data_manager.broadcast_states:
+            del user_data_manager.broadcast_states[admin_chat_id]
 
 
 def check_answer_callback(call):
-    """Обработчик проверки ответа"""
+    """Обработчик проверки ответа с обновлением логики сессии"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
     # Проверяем доступ
     if not check_user_access(chat_id, send_message=False):
-        bot.answer_callback_query(call.id, "❌ Требуется активная подписка!")
+        answer_callback_safe(bot, call.id, "❌ Требуется активная подписка!")
         return
 
-    if chat_id not in user_data:
-        bot.answer_callback_query(call.id, "⚠️ Сначала выберите тему!")
-        return
-
-    if not user_data[chat_id]['current_question']:
-        bot.answer_callback_query(call.id, "⚠️ Нет активного вопроса!")
+    # Получаем данные пользователя
+    user_data = user_data_manager.get_user_data(chat_id)
+    if not user_data.get('current_question'):
+        answer_callback_safe(bot, call.id, "⚠️ Нет активного вопроса!")
         return
 
     try:
         answer_number = int(call.data.split('_')[1])
 
-        if answer_number not in user_data[chat_id]['numbered_answers']:
-            bot.answer_callback_query(call.id, "❌ Неверный номер ответа!")
+        if answer_number not in user_data['numbered_answers']:
+            answer_callback_safe(bot, call.id, "❌ Неверный номер ответа!")
             return
 
-        selected_answer = user_data[chat_id]['numbered_answers'][answer_number]
-        correct_answers = user_data[chat_id]['correct_answer']
+        selected_answer = user_data['numbered_answers'][answer_number]
+        correct_answers = user_data['correct_answer']
+        question_text = user_data['current_question']
+        topic = user_data.get('current_question_topic', user_data.get('current_topic'))
+
+        if not topic:
+            answer_callback_safe(bot, call.id, "⚠️ Не определена тема вопроса!")
+            return
 
         # Проверяем ответ
         is_correct = selected_answer in correct_answers
+
+        # Отмечаем вопрос как отвеченный в сессии
+        user_data_manager.mark_question_answered(chat_id, topic, question_text, is_correct)
 
         # Обновляем статистику в базе данных
         db.update_statistics(chat_id, is_correct)
 
         # Обновляем статистику сессии
-        if chat_id not in session_stats:
-            session_stats[chat_id] = {
-                'session_total': 0,
-                'session_correct': 0
-            }
-
-        session_stats[chat_id]['session_total'] += 1
+        session_stats_data = user_data_manager.get_session_stats(chat_id)
+        session_stats_data['session_total'] += 1
         if is_correct:
-            session_stats[chat_id]['session_correct'] += 1
+            session_stats_data['session_correct'] += 1
 
         # Получаем общую статистику
         total_stats = db.get_user_statistics(chat_id)
 
         # Получаем статистику текущей сессии
-        session_total = session_stats[chat_id]['session_total']
-        session_correct = session_stats[chat_id]['session_correct']
+        session_total = session_stats_data['session_total']
+        session_correct = session_stats_data['session_correct']
         session_percentage = (session_correct / session_total * 100) if session_total > 0 else 0
 
         # Создаем текст результата
@@ -3925,14 +5099,13 @@ def check_answer_callback(call):
 
         # Отправляем уведомление
         if is_correct:
-            bot.answer_callback_query(call.id, "✅ Правильно!")
+            answer_callback_safe(bot, call.id, "✅ Правильно!")
         else:
-            bot.answer_callback_query(call.id, "❌ Неправильно!")
+            answer_callback_safe(bot, call.id, "❌ Неправильно!")
 
     except (ValueError, IndexError) as e:
-        print(f"❌ Ошибка обработки ответа: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка при обработке ответа.")
-
+        logger.error(f"❌ Ошибка обработки ответа: {e}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка при обработке ответа.")
 
 def logs_last_100_callback(call):
     """Последние 100 строк логов"""
@@ -3969,8 +5142,7 @@ def logs_last_100_callback(call):
             reply_markup=markup
         )
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
-
+        answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
 
 def logs_stats_callback(call):
     """Статистика логов"""
@@ -4015,7 +5187,7 @@ def logs_stats_callback(call):
             reply_markup=markup
         )
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
+        answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
 
 
 def logs_get_file_callback(call):
@@ -4029,9 +5201,9 @@ def logs_get_file_callback(call):
             with open(log_file, 'rb') as f:
                 bot.send_document(chat_id, f, caption="📁 Файл логов")
         else:
-            bot.answer_callback_query(call.id, "❌ Файл логов не найден")
+            answer_callback_safe(bot, call.id, "❌ Файл логов не найден")
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
+        answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
 
 def logs_clear_callback(call):
     """Очистить логи"""
@@ -4067,7 +5239,7 @@ def logs_clear_confirm_callback(call):
             # Очищаем файл
             open(log_file, 'w').close()
 
-            bot.answer_callback_query(call.id, "✅ Логи очищены, создана резервная копия")
+            answer_callback_safe(bot, call.id, "✅ Логи очищены, создана резервная копия")
 
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("↩️ Назад в логи", callback_data="admin_logs"))
@@ -4081,9 +5253,9 @@ def logs_clear_confirm_callback(call):
                 reply_markup=markup
             )
         else:
-            bot.answer_callback_query(call.id, "❌ Файл логов не найден")
+            answer_callback_safe(bot, call.id, "❌ Файл логов не найден")
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
+        answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
 
 
 def admin_db_callback(call):
@@ -4104,11 +5276,11 @@ def admin_db_callback(call):
             # Удаляем временный файл
             os.remove(temp_file)
 
-            bot.answer_callback_query(call.id, "✅ Файл базы данных отправлен")
+            answer_callback_safe(bot, call.id, "✅ Файл базы данных отправлен")
         else:
-            bot.answer_callback_query(call.id, "❌ Файл базы данных не найден")
+            answer_callback_safe(bot, call.id, "❌ Файл базы данных не найден")
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
+        answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
 
 def restart_confirm_callback(call):
     """Подтверждение перезагрузки бота"""
@@ -4129,10 +5301,15 @@ def restart_confirm_callback(call):
 
         # Здесь должен быть код перезагрузки бота
         # В реальном проекте это может быть перезапуск процесса
-        bot.answer_callback_query(call.id, "✅ Команда на перезагрузку отправлена")
+        answer_callback_safe(bot, call.id, "✅ Команда на перезагрузку отправлена")
 
     except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
+        answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
+
+
+
+
+
 
 def payment_instructions_callback(call):
     """Инструкция по оплате"""
@@ -4150,77 +5327,278 @@ def payment_instructions_callback(call):
         parse_mode='HTML',
         reply_markup=markup
     )
-    bot.answer_callback_query(call.id)
+    answer_callback_safe(bot, call.id)
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback_query(call):
-    """Обработчик всех callback-запросов"""
+
+def handle_topic_selection(call):
+    """ЕДИНСТВЕННЫЙ обработчик выбора темы"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    # Проверяем доступ
+    if not check_user_access(chat_id, send_message=False):
+        answer_callback_safe(bot, call.id, "❌ Требуется активная подписка!")
+        return
+
     try:
-        chat_id = call.message.chat.id
-        message_id = call.message.message_id
+        # Поддерживаем оба формата: "t_0" и "topic_0"
+        parts = call.data.split('_')
+        if len(parts) < 2:
+            answer_callback_safe(bot, call.id, "❌ Неверный формат выбора темы")
+            return
 
-        print(f"🔄 Callback: {call.data} от {chat_id}")
+        topic_num = int(parts[1])
 
-        # Маршрутизация по типам callback
-        if call.data == "main_menu":
-            main_menu_callback(call)
-        elif call.data == "random_question":
-            random_question_callback(call)
-        elif call.data == "show_stats":
-            show_stats_callback(call)
-        elif call.data == "change_topic":
-            change_topic_callback(call)
-        elif call.data == "get_question":
-            get_question_callback(call)
-        elif call.data == "subscribe_info":
-            subscribe_info_callback(call)
-        elif call.data == "subscribe":
-            subscribe_callback(call)
-        elif call.data == "trial":
-            trial_callback(call)
-        elif call.data == "info":
-            info_callback(call)
-        elif call.data == "help_menu":
-            help_menu_callback(call)
-        elif call.data == "check_questions":
-            check_questions_callback(call)
-        elif call.data.startswith('topic_'):
-            select_topic_callback(call)
-        elif call.data.startswith('answer_'):
-            check_answer_callback(call)
-        elif call.data == "top_players":
-            top_players_callback(call)
-        elif call.data == "subscription_terms":
-            subscription_terms_callback(call)
-        elif call.data == "pay_now":
-            pay_now_callback(call)
-        elif call.data.startswith('check_payment_'):
-            check_payment_callback(call)
-        elif call.data == "payment_instructions":
-            payment_instructions_callback(call)
-        # Админские callback-ы
-        elif any(call.data.startswith(prefix) for prefix in ['admin_', 'logs_', 'restart_', 'back_to_admin',
-                                                              'confirm_extend_']):
-            handle_admin_callback(call)
-        # Обработчики продления подписки (отдельно)
-        elif call.data == "extend_user_menu":
-            extend_user_menu_callback(call)
-        elif call.data == "extend_all_menu":
-            extend_all_menu_callback(call)
-        elif call.data.startswith('extend_user_') and not call.data.startswith('extend_user_menu'):
-            handle_extend_user_callback(call)
-        elif call.data.startswith('extend_all_') and not call.data.startswith('extend_all_menu'):
-            handle_extend_all_callback(call)
+        # Валидация
+        if topic_num < 0 or topic_num >= len(topics_list):
+            logger.error(f"❌ Неверный номер темы: {topic_num}, всего тем: {len(topics_list)}")
+            answer_callback_safe(bot, call.id, "❌ Неверный номер темы")
+            return
+
+        selected_topic = topics_list[topic_num]
+        topic_display = selected_topic[:30] + "..." if len(selected_topic) > 30 else selected_topic
+
+        # Очищаем сессию для новой темы
+        user_data_manager.clear_topic_session(chat_id, selected_topic)
+
+        # Сохраняем выбранную тему
+        user_data_manager.update_user_data(
+            chat_id,
+            current_topic=selected_topic,
+            current_question=None,
+            correct_answer=None,
+            numbered_answers={},
+            answers_list=[],
+            current_question_topic=selected_topic
+        )
+
+        # Получаем статистику
+        if selected_topic == "🎲 Все темы (рандом)":
+            topic_questions_count = sum(len(q) for q in questions_by_topic.values())
         else:
-            bot.answer_callback_query(call.id, "❌ Неизвестная команда")
+            topic_questions_count = len(questions_by_topic.get(selected_topic, []))
+
+        user_data = user_data_manager.get_user_data(chat_id)
+        answered_questions = user_data.get('answered_questions', {}).get(selected_topic, [])
+        answered_count = len(answered_questions)
+        remaining_count = topic_questions_count - answered_count
+
+        topic_info = f"""
+✅ <b>Выбрана тема:</b> {selected_topic}
+📊 <b>Вопросов в теме:</b> {topic_questions_count}
+
+📈 <b>Прогресс:</b>
+• Отвечено: {answered_count}/{topic_questions_count}
+• Осталось: {remaining_count}
+
+👇 Выберите действие:
+        """
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("🎲 Начать/продолжить", callback_data="get_question"),
+            types.InlineKeyboardButton("🔄 Начать заново", callback_data=f"r_{topic_num}")
+        )
+        markup.add(
+            types.InlineKeyboardButton("📊 Статистика", callback_data="show_stats"),
+            types.InlineKeyboardButton("🔄 Выбрать другую тему", callback_data="change_topic")
+        )
+        markup.add(
+            types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
+        )
+
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=topic_info,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+            answer_callback_safe(bot, call.id, f"Выбрана тема: {topic_display}")
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании: {e}")
+            bot.send_message(chat_id, topic_info, parse_mode='HTML', reply_markup=markup)
+            answer_callback_safe(bot, call.id, f"Выбрана тема: {topic_display}")
+
+    except ValueError as e:
+        logger.error(f"❌ Ошибка парсинга номера темы: {call.data} - {e}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка при выборе темы")
+    except Exception as e:
+        logger.error(f"❌ Неизвестная ошибка в handle_topic_selection: {e}")
+        logger.error(traceback.format_exc())
+        answer_callback_safe(bot, call.id, "❌ Ошибка выбора темы")
+
+
+def handle_topic_restart(call):
+    """ЕДИНСТВЕННЫЙ обработчик перезапуска темы"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    try:
+        parts = call.data.split('_')
+        if len(parts) < 2:
+            answer_callback_safe(bot, call.id, "❌ Неверный формат")
+            return
+
+        topic_num = int(parts[1])
+
+        if 0 <= topic_num < len(topics_list):
+            selected_topic = topics_list[topic_num]
+            topic_display = selected_topic[:30] + "..." if len(selected_topic) > 30 else selected_topic
+
+            # Очищаем сессию
+            user_data_manager.clear_topic_session(chat_id, selected_topic)
+
+            # Сбрасываем статистику сессии
+            session_stats = user_data_manager.get_session_stats(chat_id)
+            session_stats['session_total'] = 0
+            session_stats['session_correct'] = 0
+
+            user_data_manager.update_user_data(
+                chat_id,
+                current_topic=selected_topic,
+                current_question=None,
+                correct_answer=None,
+                numbered_answers={},
+                answers_list=[],
+                current_question_topic=selected_topic
+            )
+
+            if selected_topic == "🎲 Все темы (рандом)":
+                topic_questions_count = sum(len(q) for q in questions_by_topic.values())
+            else:
+                topic_questions_count = len(questions_by_topic.get(selected_topic, []))
+
+            restart_text = f"""
+🔄 <b>Сессия для темы '{topic_display}' перезапущена!</b>
+
+📊 <b>Вопросов в теме:</b> {topic_questions_count}
+📈 <b>Прогресс:</b> 0/{topic_questions_count} (0.0%)
+
+👇 Выберите действие:
+            """
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("🎲 Начать обучение", callback_data="get_question"),
+                types.InlineKeyboardButton("📊 Статистика", callback_data="show_stats")
+            )
+            markup.add(
+                types.InlineKeyboardButton("↩️ Назад к выбору темы", callback_data="change_topic"),
+                types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
+            )
+
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=restart_text,
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+                answer_callback_safe(bot, call.id, f"Сессия для '{topic_display}' перезапущена")
+            except Exception as e:
+                logger.error(f"Ошибка при редактировании: {e}")
+                bot.send_message(chat_id, restart_text, parse_mode='HTML', reply_markup=markup)
+                answer_callback_safe(bot, call.id, f"Сессия для '{topic_display}' перезапущена")
+        else:
+            answer_callback_safe(bot, call.id, "❌ Неверный номер темы")
 
     except Exception as e:
-        print(f"❌ Ошибка в обработчике callback: {e}")
-        traceback.print_exc()
-        try:
-            bot.answer_callback_query(call.id, "❌ Произошла ошибка")
-        except:
-            pass
+        logger.error(f"❌ Ошибка в handle_topic_restart: {e}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка перезапуска")
+
+
+def handle_topic_restart(call):
+    """Обработчик перезапуска темы из упрощенного формата (r_0, r_1)"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    try:
+        # Извлекаем номер темы из callback_data (формат: r_0, r_1 и т.д.)
+        topic_num = int(call.data.split('_')[1])
+
+        if 0 <= topic_num < len(topics_list):
+            selected_topic = topics_list[topic_num]
+            topic_display = selected_topic[:30] + "..." if len(selected_topic) > 30 else selected_topic
+
+            # Очищаем сессию для темы
+            user_data_manager.clear_topic_session(chat_id, selected_topic)
+
+            # Обнуляем статистику сессии
+            session_stats = user_data_manager.get_session_stats(chat_id)
+            session_stats['session_total'] = 0
+            session_stats['session_correct'] = 0
+
+            user_data_manager.update_user_data(
+                chat_id,
+                current_topic=selected_topic,
+                current_question=None,
+                correct_answer=None,
+                numbered_answers={},
+                answers_list=[],
+                current_question_topic=selected_topic
+            )
+
+            # Получаем обновленную информацию о теме
+            if selected_topic == "🎲 Все темы (рандом)":
+                topic_questions_count = sum(len(q) for q in questions_by_topic.values())
+            elif selected_topic in questions_by_topic:
+                topic_questions_count = len(questions_by_topic[selected_topic])
+            else:
+                topic_questions_count = 0
+
+            # Формируем сообщение
+            restart_text = f"""
+🔄 <b>Сессия для темы '{topic_display}' перезапущена!</b>
+
+📊 <b>Вопросов в теме:</b> {topic_questions_count}
+📈 <b>Прогресс:</b> 0/{topic_questions_count} (0.0%)
+
+👇 Выберите действие:
+            """
+
+            # Создаем кнопки с безопасными callback_data
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("🎲 Начать обучение", callback_data="get_question"),
+                types.InlineKeyboardButton("📊 Статистика", callback_data="show_stats")
+            )
+            markup.add(
+                types.InlineKeyboardButton("↩️ Назад к выбору темы", callback_data="change_topic"),
+                types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
+            )
+
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=restart_text,
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+                answer_callback_safe(bot, call.id, f"Сессия для '{topic_display}' перезапущена")
+            except Exception as e:
+                logger.error(f"Ошибка при редактировании сообщения: {e}")
+                bot.send_message(
+                    chat_id,
+                    restart_text,
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+                answer_callback_safe(bot, call.id, f"Сессия для '{topic_display}' перезапущена")
+        else:
+            logger.error(f"❌ Неверный номер темы для перезапуска: {topic_num}")
+            answer_callback_safe(bot, call.id, "❌ Неверный номер темы")
+
+    except ValueError as e:
+        logger.error(f"❌ Ошибка парсинга номера темы для перезапуска: {call.data} - {e}")
+        answer_callback_safe(bot, call.id, "❌ Ошибка перезапуска темы")
+    except Exception as e:
+        logger.error(f"❌ Неизвестная ошибка в handle_topic_restart: {e}")
+        logger.error(traceback.format_exc())
+        answer_callback_safe(bot, call.id, "❌ Ошибка перезапуска")
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
@@ -4228,7 +5606,7 @@ def handle_start(message):
     chat_id = message.chat.id
     user = message.from_user
 
-    print(f"📨 Получен /start от {user.first_name} (ID: {chat_id})")
+    logger.info(f"📨 Получен /start от {user.first_name} (ID: {chat_id})")
 
     # Регистрируем пользователя
     db.add_user(
@@ -4242,20 +5620,18 @@ def handle_start(message):
     if not check_user_access(chat_id):
         return
 
-    # Инициализируем данные пользователя
-    user_data[chat_id] = {
-        'current_topic': None,
-        'current_question': None,
-        'correct_answer': None,
-        'numbered_answers': {},
-        'answers_list': []
-    }
+    # Инициализируем данные пользователя через менеджер
+    user_data_manager.update_user_data(
+        chat_id,
+        current_topic=None,
+        current_question=None,
+        correct_answer=None,
+        numbered_answers={},
+        answers_list=[]
+    )
 
-    # Инициализируем статистику сессии
-    session_stats[chat_id] = {
-        'session_total': 0,
-        'session_correct': 0
-    }
+    # Инициализируем статистику сессии через менеджер
+    user_data_manager.get_session_stats(chat_id)
 
     # Отправляем приветственное сообщение
     welcome_text = f"""
@@ -4275,6 +5651,214 @@ def handle_start(message):
         reply_markup=create_main_menu()
     )
 
+# Использование в обработчиках:
+@bot.message_handler(func=lambda message: True)
+def rate_limit_wrapper(message):
+    """Обертка для rate limiting"""
+    user_id = message.chat.id
+
+    if not rate_limiter.check(user_id):
+        bot.send_message(
+            user_id,
+            "⚠️ <b>Слишком много запросов!</b>\n\n"
+            "Пожалуйста, подождите 1 минуту перед следующим запросом.",
+            parse_mode='HTML'
+        )
+        return
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def universal_callback_handler(call):
+    user_id = call.from_user.id
+
+    # Rate limiting для callback
+    if not rate_limiter.check_callback(user_id):
+        try:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ Слишком много запросов! Подождите минуту.",
+                show_alert=True
+            )
+        except:
+            pass
+        return
+    try:
+        # Логируем полученный callback для отладки
+        logger.info(
+            f"📨 Callback получен: {call.data} от пользователя {call.from_user.id} ({call.from_user.username or 'нет username'})")
+
+        # Безопасный ответ на callback
+        def safe_answer(text=None, show_alert=False):
+            try:
+                if text:
+                    bot.answer_callback_query(call.id, text=text, show_alert=show_alert)
+                else:
+                    bot.answer_callback_query(call.id)
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось ответить на callback {call.id}: {e}")
+
+        # Маршрутизация по типам callback
+        data = call.data
+
+        # 1. Главное меню и основные действия
+        if data == "main_menu":
+            main_menu_callback(call)
+            safe_answer()
+        elif data == "show_stats":
+            show_stats_callback(call)
+            safe_answer()
+        elif data == "change_topic":
+            change_topic_callback(call)
+            safe_answer()
+        elif data == "get_question":
+            get_question_callback(call)
+            safe_answer("🔄 Загружаю вопрос...")
+        elif data == "random_question":
+            random_question_callback(call)
+            safe_answer("🎲 Загружаю случайный вопрос...")
+        elif data == "subscribe_info":
+            subscribe_info_callback(call)
+            safe_answer()
+        elif data == "subscribe":
+            subscribe_callback(call)
+            safe_answer()
+        elif data == "pay_now":
+            pay_now_callback(call)
+            safe_answer("🔄 Создаю платеж...")
+        elif data == "trial":
+            trial_callback(call)
+            safe_answer()
+        elif data == "info":
+            info_callback(call)
+            safe_answer()
+        elif data == "help_menu":
+            help_menu_callback(call)
+            safe_answer()
+        elif data == "top_players":
+            top_players_callback(call)
+            safe_answer()
+        elif data == "subscription_terms":
+            subscription_terms_callback(call)
+            safe_answer()
+        elif data == "check_questions":
+            check_questions_callback(call)
+            safe_answer()
+        elif data in ["reset_my_stats", "confirm_reset_stats", "reset_topic_progress", "confirm_reset_topic"]:
+            reset_my_stats_callback(call)
+
+        # 2. Выбор темы (упрощенный формат - ВАЖНО!)
+        elif data.startswith("t_"):  # Например: t_0, t_1
+            handle_topic_selection(call)
+            # Не отвечаем здесь, т.к. handle_topic_selection сам отвечает
+
+        # 3. Ответы на вопросы
+        elif data.startswith("answer_"):
+            check_answer_callback(call)
+
+        # 4. Платежи
+        elif data.startswith("check_payment_"):
+            check_payment_callback(call)
+            safe_answer("🔄 Проверяем статус оплаты...")
+
+        # 5. Административные функции
+        elif data.startswith("admin_"):
+            handle_admin_callback(call)
+            safe_answer()
+        elif data.startswith("extend_all_hours_") or data.startswith("extend_all_days_") or \
+                data.startswith("extend_user_") or data.startswith("confirm_extend_"):
+            # Проверяем, является ли пользователь администратором
+            user = db.get_user(call.from_user.id)
+            if user and user.get('is_admin'):
+                if data.startswith("extend_all_"):
+                    handle_extend_all_callback(call)
+                elif data.startswith("extend_user_"):
+                    handle_extend_user_callback(call)
+                elif data.startswith("confirm_extend_"):
+                    handle_confirm_extend_callback(call)
+                safe_answer()
+            else:
+                safe_answer("❌ Нет прав администратора!", show_alert=True)
+        # 7. Перезапуск темы (упрощенный формат)
+        elif data.startswith("r_"):
+            handle_topic_restart(call)
+            # Не отвечаем здесь, т.к. handle_topic_restart сам отвечает
+
+        # 8. Массовая рассылка
+        elif data in ["confirm_broadcast", "edit_broadcast", "cancel_broadcast", "broadcast_active_only"]:
+            handle_broadcast_callback(call)
+
+        # 9. Логи (админка)
+        elif data in ["logs_last_100", "logs_stats", "logs_get_file", "logs_clear",
+                      "logs_clear_confirm", "admin_db", "admin_restart", "restart_confirm",
+                      "back_to_admin", "admin_stats", "admin_users", "admin_grant_sub",
+                      "admin_grant_admin", "admin_broadcast", "admin_logs", "admin_extend_sub",
+                      "extend_user_menu", "extend_all_menu"]:
+            handle_admin_callback(call)
+            safe_answer()
+
+        # 10. Кнопка "Назад"
+        elif data == "back" or data.startswith("back_to_"):
+            try:
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text="↩️ Возвращаюсь назад...",
+                    parse_mode='HTML'
+                )
+                # Через секунду обновляем
+                time.sleep(0.5)
+                if data == "back_to_admin":
+                    back_to_admin_callback(call)
+                else:
+                    main_menu_callback(call)
+                safe_answer()
+            except:
+                # Если не удалось отредактировать, отправляем новое сообщение
+                bot.send_message(call.message.chat.id, "↩️ Возвращаюсь назад...")
+                main_menu_callback(call)
+            safe_answer()
+
+        # 11. Неизвестный callback
+        else:
+            logger.warning(f"⚠️ Неизвестный callback: {data}")
+            safe_answer("⚠️ Неизвестная команда", show_alert=False)
+
+    except telebot.apihelper.ApiTelegramException as e:
+        # Ошибки Telegram API
+        error_msg = str(e)
+        if "BUTTON_DATA_INVALID" in error_msg:
+            logger.error(f"❌ НЕВЕРНЫЙ ФОРМАТ КНОПКИ: {call.data}")
+            safe_answer("❌ Ошибка формата кнопки")
+        elif "query is too old" in error_msg or "query ID is invalid" in error_msg:
+            # Игнорируем ошибки устаревших callback
+            logger.warning(f"⚠️ Callback устарел: {call.data}")
+        elif "message is not modified" in error_msg:
+            # Игнорируем ошибку "сообщение не изменено"
+            logger.warning(f"⚠️ Сообщение не было изменено: {call.data}")
+        elif "message to edit not found" in error_msg:
+            logger.error(f"❌ Сообщение для редактирования не найдено: {call.data}")
+            # Пытаемся отправить новое сообщение
+            try:
+                bot.send_message(
+                    call.message.chat.id,
+                    "⚠️ Произошла ошибка. Попробуйте снова.",
+                    reply_markup=create_main_menu()
+                )
+            except:
+                pass
+        else:
+            logger.error(f"❌ Ошибка Telegram API в callback {call.data}: {e}")
+
+    except Exception as e:
+        # Все остальные ошибки
+        logger.error(f"❌ Критическая ошибка в callback обработчике: {e}")
+        logger.error(traceback.format_exc())
+
+        # Пытаемся уведомить пользователя об ошибке
+        try:
+            safe_answer("❌ Произошла ошибка. Попробуйте снова.", show_alert=False)
+        except:
+            pass
 # ============================================================================
 # ЗАПУСК БОТА
 # ============================================================================
@@ -4293,22 +5877,69 @@ def setup_scheduler():
             name='Проверка подписок'
         )
 
+        # Ежедневная синхронизация платежей (в 1:00 ночи)
+        scheduler.add_job(
+            sync_paid_subscriptions_on_startup,
+            trigger=CronTrigger(hour=1, minute=0, timezone=NOVOSIBIRSK_TZ),
+            id='daily_payment_sync',
+            name='Синхронизация платежей'
+        )
+
+        # Периодическая очистка памяти (каждые 30 минут)
+        scheduler.add_job(
+            user_data_manager.cleanup_old_data,
+            trigger='interval',
+            minutes=30,
+            id='memory_cleanup',
+            name='Очистка памяти'
+        )
+
+        # Логирование использования памяти (каждый час)
+        scheduler.add_job(
+            log_memory_usage,
+            trigger='interval',
+            hours=1,
+            id='memory_log',
+            name='Логирование памяти'
+        )
+
         scheduler.start()
-        print("✅ Планировщик задач запущен")
+        logger.info("✅ Планировщик задач запущен")
 
         # Выводим информацию о запущенных задачах
         jobs = scheduler.get_jobs()
-        print(f"📋 Загружено задач: {len(jobs)}")
+        logger.info(f"📋 Загружено задач: {len(jobs)}")
         for job in jobs:
             next_run = job.next_run_time.astimezone(NOVOSIBIRSK_TZ).strftime(
                 '%d.%m.%Y %H:%M') if job.next_run_time else "Не запланировано"
-            print(f"  - {job.name}: следующий запуск {next_run}")
+            logger.info(f"  - {job.name}: следующий запуск {next_run}")
 
         return scheduler
 
     except Exception as e:
-        print(f"❌ Ошибка при настройке планировщика: {e}")
+        logger.info(f"❌ Ошибка при настройке планировщика: {e}")
         return None
+
+
+def log_memory_usage():
+    """Логирование использования памяти"""
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+
+        user_data_memory = user_data_manager.get_memory_usage()
+
+        logger.info(f"📊 Использование памяти: {memory_mb:.2f} MB (данные пользователей: {user_data_memory:.2f} MB)")
+
+        # Дополнительно: логируем количество активных пользователей
+        active_users = len(user_data_manager.user_data)
+        logger.info(f"👥 Активных пользователей в памяти: {active_users}")
+
+    except ImportError:
+        logger.info("ℹ️ psutil не установлен, логирование памяти недоступно")
+    except Exception as e:
+        logger.error(f"Ошибка логирования памяти: {e}")
 
 
 def check_and_update_subscriptions():
@@ -4353,7 +5984,7 @@ def check_and_update_subscriptions():
                     })
                     users_to_update.append(user_id)
             except (ValueError, TypeError) as e:
-                print(f"⚠️ Ошибка парсинга даты для пользователя {user_id}: {e}")
+                logger.info(f"⚠️ Ошибка парсинга даты для пользователя {user_id}: {e}")
                 continue
 
         # Обновляем истекшие подписки
@@ -4368,12 +5999,12 @@ def check_and_update_subscriptions():
             ''', users_to_update)
 
             conn.commit()
-            print(f"✅ Обновлено {len(users_to_update)} истекших подписок")
+            logger.info(f"✅ Обновлено {len(users_to_update)} истекших подписок")
 
         conn.close()
 
     except Exception as e:
-        print(f"❌ Ошибка при проверке подписок: {e}")
+        logger.info(f"❌ Ошибка при проверке подписок: {e}")
 
 
 def shutdown_handler(signum=None, frame=None):
@@ -4385,28 +6016,25 @@ def shutdown_handler(signum=None, frame=None):
             try:
                 # Проверяем, запущен ли планировщик
                 if hasattr(scheduler, 'running') and scheduler.running:
-                    print("⏰ Останавливаю планировщик...")
+                    logger.info("⏰ Останавливаю планировщик...")
                     scheduler.shutdown(wait=False)
                 elif hasattr(scheduler, '_stopped'):
                     # Альтернативная проверка для разных версий APScheduler
                     if not scheduler._stopped:
-                        print("⏰ Останавливаю планировщик...")
+                        logger.info("⏰ Останавливаю планировщик...")
                         scheduler.shutdown(wait=False)
                     else:
-                        print("ℹ️ Планировщик уже остановлен")
+                        logger.info("ℹ️ Планировщик уже остановлен")
                 else:
-                    print("ℹ️ Планировщик не запущен")
+                    logger.info("ℹ️ Планировщик не запущен")
             except AttributeError:
-                print("ℹ️ Планировщик в неопределенном состоянии")
+                logger.info("ℹ️ Планировщик в неопределенном состоянии")
             except Exception as e:
-                print(f"⚠️ Ошибка при остановке планировщика: {e}")
+                logger.info(f"⚠️ Ошибка при остановке планировщика: {e}")
         else:
-            print("ℹ️ Планировщик не инициализирован")
+            logger.info("ℹ️ Планировщик не инициализирован")
     except Exception as e:
-        print(f"⚠️ Неожиданная ошибка: {e}")
-
-    print("👋 Завершение работы бота")
-    sys.exit(0)
+        logger.info(f"⚠️ Неожиданная ошибка: {e}")
 
 
 def setup_admin_from_env():
@@ -4416,7 +6044,7 @@ def setup_admin_from_env():
         admin_ids_str = os.getenv('ADMIN_IDS', '')
 
         if not admin_ids_str:
-            print("⚠️ Переменная окружения ADMIN_IDS не установлена")
+            logger.info("⚠️ Переменная окружения ADMIN_IDS не установлена")
             return False
 
         # Парсим ID администраторов (могут быть разделены запятыми или пробелами)
@@ -4426,18 +6054,18 @@ def setup_admin_from_env():
                 admin_id = int(item.strip())
                 admin_ids.append(admin_id)
             except ValueError:
-                print(f"⚠️ Некорректный ID администратора: {item}")
+                logger.info(f"⚠️ Некорректный ID администратора: {item}")
 
         if not admin_ids:
-            print("⚠️ Не удалось распарсить ID администраторов")
+            logger.info("⚠️ Не удалось распарсить ID администраторов")
             return False
 
-        print(f"👑 Настройка администраторов из переменных окружения: {admin_ids}")
+        logger.info(f"👑 Настройка администраторов из переменных окружения: {admin_ids}")
 
         # Подключаемся к базе данных
         db_path = 'data/users.db'
         if not os.path.exists(db_path):
-            print(f"❌ База данных не найдена: {db_path}")
+            logger.info(f"❌ База данных не найдена: {db_path}")
             return False
 
         conn = sqlite3.connect(db_path)
@@ -4459,53 +6087,131 @@ def setup_admin_from_env():
                         last_activity = CURRENT_TIMESTAMP
                     WHERE telegram_id = ?
                     ''', (admin_id,))
-                    print(f"✅ Пользователь {admin_id} назначен администратором")
+                    logger.info(f"✅ Пользователь {admin_id} назначен администратором")
                 else:
                     # Создаем нового пользователя как администратора
                     cursor.execute('''
                     INSERT INTO users (telegram_id, is_admin, registration_date, last_activity)
                     VALUES (?, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ''', (admin_id,))
-                    print(f"✅ Создан новый пользователь {admin_id} с правами администратора")
+                    logger.info(f"✅ Создан новый пользователь {admin_id} с правами администратора")
 
                 updated_count += 1
 
             except sqlite3.Error as e:
-                print(f"❌ Ошибка при назначении администратора {admin_id}: {e}")
+                logger.info(f"❌ Ошибка при назначении администратора {admin_id}: {e}")
 
         conn.commit()
         conn.close()
 
-        print(f"✅ Успешно настроено {updated_count} администраторов")
+        logger.info(f"✅ Успешно настроено {updated_count} администраторов")
         return True
 
     except Exception as e:
-        print(f"❌ Ошибка при настройке администраторов: {e}")
+        logger.info(f"❌ Ошибка при настройке администраторов: {e}")
         return False
 
 
 # ============================================================================
 # ФУНКЦИЯ ДЛЯ ОДНОРАЗОВОГО ВЫПОЛНЕНИЯ ПРИ ЗАПУСКЕ
 # ============================================================================
-
+db = Database()
 def run_startup_tasks():
     """Задачи, выполняемые один раз при запуске бота"""
+    check_database_health()
+    # Обновление схемы БД (добавление новой колонки)
+    logger.info("🔄 Обновление схемы базы данных...")
+    db.upgrade_database()
 
-    # Назначение администраторов из переменных окружения
+    # Очистка старых платежей
+    logger.info("🧹 Очистка старых платежей...")
+    cleaned_count = cleanup_old_payments()
+    if cleaned_count > 0:
+        logger.info(f"✅ Очищено {cleaned_count} старых платежей")
+
+    # Проверка согласованности данных
+    logger.info("🔍 Проверка согласованности данных...")
+    check_subscription_consistency()
+
+    # Синхронизация оплаченных подписок (только за последние 3 дня)
+    logger.info("💰 Синхронизация свежих оплаченных подписок...")
+    sync_result = sync_paid_subscriptions_on_startup()
+    if sync_result:
+        logger.info(f"✅ Синхронизация завершена: "
+                    f"{sync_result['activated']}/{sync_result['total']} подписок активировано "
+                    f"(проверялись платежи за {sync_result['max_days']} дня)")
+
+    # Назначение администраторов
     if setup_admin_from_env():
-        print("✅ Назначение администраторов выполнено успешно")
+        logger.info("✅ Назначение администраторов выполнено успешно")
     else:
-        print("⚠️ Назначение администраторов не выполнено")
+        logger.info("⚠️ Назначение администраторов не выполнено")
 
     if setup_bot_commands():
-        print("✅ Меню команд бота настроено")
+        logger.info("✅ Меню команд бота настроено")
     else:
-        print("⚠️ Не удалось настроить меню команд бота")
+        logger.info("⚠️ Не удалось настроить меню команд бота")
+
+
+def safe_polling():
+    """Безопасный запуск бота с восстановлением после сбоев"""
+    polling_interval = 1
+    timeout = 30
+    max_retries = 10
+    retry_count = 0
+
+    # Очистка вебхука перед запуском
+    try:
+        bot.delete_webhook()
+        logger.info("✅ Вебхук удален")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось удалить вебхук: {e}")
+
+    while retry_count < max_retries:
+        try:
+            logger.info(f"🚀 Запуск бота, попытка #{retry_count + 1}")
+
+            bot.infinity_polling(
+                timeout=timeout,
+                long_polling_timeout=30,
+                logger_level=logging.INFO
+            )
+
+        except KeyboardInterrupt:
+            logger.info("👋 Завершение работы по запросу пользователя")
+            break
+        except telebot.apihelper.ApiException as e:
+            logger.error(f"❌ Ошибка Telegram API: {e}")
+            retry_count += 1
+
+            if "Conflict" in str(e):
+                logger.error("⚠️ Конфликт: другой инстанс бота уже запущен")
+                time.sleep(30)
+            else:
+                time.sleep(5)
+
+        except ConnectionError as e:
+            logger.error(f"❌ Ошибка соединения: {e}")
+            retry_count += 1
+            time.sleep(10)
+
+        except Exception as e:
+            logger.error(f"❌ Непредвиденная ошибка: {e}")
+            logger.error(traceback.format_exc())
+            retry_count += 1
+            time.sleep(15)
+
+        finally:
+            # Плавное завершение
+            shutdown_handler()
+
+    if retry_count >= max_retries:
+        logger.error(f"🚫 Достигнут лимит попыток перезапуска. Бот остановлен.")
 
 
 if __name__ == "__main__":
     logger.info("=" * 50)
-    logger.info("🚀 Запуск бота...")
+    logger.info("🚀 Запуск бота с оптимизациями...")
     logger.info("=" * 50)
 
     # Выполняем стартовые задачи
@@ -4517,7 +6223,6 @@ if __name__ == "__main__":
 
     # Логирование запуска планировщика
     logger.info("⏰ Настройка планировщика...")
-    # Запускаем планировщик
     setup_scheduler()
 
     # Настраиваем обработчики сигналов
@@ -4525,16 +6230,11 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown_handler)
     atexit.register(shutdown_handler)
 
-    logger.info("✅ Все системы запущены. Ожидание сообщений...")
-    logger.info("=" * 50)
+    # Запускаем бота в безопасном режиме
+    safe_polling()
 
-    # Запускаем бота
-    try:
-        bot.polling(none_stop=True, interval=1, timeout=30)
-    except Exception as e:
-        print(f"❌ Ошибка при запуске бота: {e}")
-        traceback.print_exc()
+    # Финальная очистка
+    logger.info("🧹 Завершение работы...")
+    user_data_manager.cleanup_old_data()
 
-        # Останавливаем планировщик при ошибке
-        if scheduler:
-            scheduler.shutdown()
+    logger.info("👋 Бот завершил работу")
