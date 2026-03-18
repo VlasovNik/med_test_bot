@@ -19,9 +19,7 @@ from pytz import timezone as pytz_timezone
 import logging
 from logging.handlers import RotatingFileHandler
 import traceback
-import json
-from collections import defaultdict
-from typing import Optional, Dict, List, Any, Set
+from typing import Optional, Dict, List
 import shutil
 import yookassa
 from yookassa import Payment, Configuration
@@ -35,6 +33,10 @@ from threading import Lock  # для потокобезопасности
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ============================================================================
+# ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ УДОБНОГО ЛОГИРОВАНИЯ
+# ============================================================================
 def setup_logging():
     """Настройка системы логирования"""
     # Создаем папку /data если её нет
@@ -63,6 +65,15 @@ def setup_logging():
     )
 
     print(f"✅ Логирование настроено. Файл логов: {log_file}")
+
+def log_user_action(user_id: int, action: str, details: str = ""):
+    """Логирование действий пользователя"""
+    user_info = db.get_user(user_id)
+    username = f"@{user_info.get('username', 'нет')}" if user_info else "неизвестен"
+    log_msg = f"👤 Пользователь {user_id} ({username}): {action}"
+    if details:
+        log_msg += f" - {details}"
+    logger.info(log_msg)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -94,21 +105,13 @@ else:
 
 bot = telebot.TeleBot(TOKEN)
 NOVOSIBIRSK_TZ = pytz_timezone('Asia/Novosibirsk')
+# Настройка для telebot
+#telebot.apihelper.API_URL = "https://api.telegram.org/bot{0}/{1}"
+telebot.apihelper.SESSION_TIME_TO_LIVE = 5 * 60
 
 # ============================================================================
-# ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ УДОБНОГО ЛОГИРОВАНИЯ
+# УТИЛИТЫ
 # ============================================================================
-def log_user_action(user_id: int, action: str, details: str = ""):
-    """Логирование действий пользователя"""
-    user_info = db.get_user(user_id)
-    username = f"@{user_info.get('username', 'нет')}" if user_info else "неизвестен"
-    log_msg = f"👤 Пользователь {user_id} ({username}): {action}"
-    if details:
-        log_msg += f" - {details}"
-    logger.info(log_msg)
-
-
-# Настройка повторных попыток для requests
 def setup_retry_session():
     session = requests.Session()
     retry = Retry(
@@ -121,15 +124,138 @@ def setup_retry_session():
     session.mount('https://', adapter)
     return session
 
-# Настройка для telebot
-#telebot.apihelper.API_URL = "https://api.telegram.org/bot{0}/{1}"
-telebot.apihelper.SESSION_TIME_TO_LIVE = 5 * 60
+def validate_user_id(user_id):
+    """Валидация ID пользователя"""
+    try:
+        user_id_int = int(user_id)
+        if user_id_int <= 0:
+            raise ValueError("ID должен быть положительным числом")
+        if user_id_int > 2**63 - 1:  # Максимальный для Telegram
+            raise ValueError("ID слишком большой")
+        return user_id_int
+    except (ValueError, TypeError):
+        raise ValueError(f"Некорректный ID пользователя: {user_id}")
 
+def validate_days(days):
+    """Валидация количества дней"""
+    try:
+        days_int = int(days)
+        if days_int < 0:
+            raise ValueError("Количество дней не может быть отрицательным")
+        if days_int > 3650:  # 10 лет максимум
+            raise ValueError("Слишком большой срок")
+        return days_int
+    except (ValueError, TypeError):
+        raise ValueError(f"Некорректное количество дней: {days}")
+
+def answer_callback_safe(bot_instance, call_id, text=None, show_alert=False):
+    """Безопасный ответ на callback query"""
+    try:
+        if text:
+            bot_instance.answer_callback_query(call_id, text=text, show_alert=show_alert)
+        else:
+            bot_instance.answer_callback_query(call_id)
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось ответить на callback {call_id}: {e}")
+        return False
+
+    def send_message_async(chat_id, text, parse_mode=None, reply_markup=None):
+        """Асинхронная отправка сообщений без блокировки основного потока"""
+        import threading
+
+        def send():
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True  # Ускоряет отправку
+                )
+            except Exception as e:
+                logger.error(f"Ошибка асинхронной отправки: {e}")
+
+        thread = threading.Thread(target=send)
+        thread.daemon = True  # Поток завершится с основным
+        thread.start()
 
 # ============================================================================
 # КЛАСС ДЛЯ УПРАВЛЕНИЯ ДАННЫМИ ПОЛЬЗОВАТЕЛЕЙ С TTL
 # ============================================================================
+class CacheManager:
+    """Менеджер кеширования для ускорения работы"""
 
+    def __init__(self, ttl_seconds=300):
+        self.cache = {}
+        self.ttl = ttl_seconds
+
+    def get(self, key):
+        """Получение значения из кеша"""
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return value
+            else:
+                del self.cache[key]  # Удаляем просроченный кеш
+        return None
+
+    def set(self, key, value):
+        """Установка значения в кеш"""
+        self.cache[key] = (value, time.time())
+
+    def delete(self, key):
+        """Удаление значения из кеша"""
+        self.cache.pop(key, None)
+
+    def clear(self):
+        """Очистка кеша"""
+        self.cache.clear()
+# ============================================================================
+# ЛИМИТЫ ЗАПРОСОВ
+# ============================================================================
+class RateLimiter:
+    def __init__(self, max_requests=10, per_seconds=60):
+        self.requests = {}
+        self.callback_requests = {}  # ОТДЕЛЬНО ДЛЯ CALLBACK
+        self.max_requests = max_requests
+        self.per_seconds = per_seconds
+        self.lock = Lock()
+
+    def check(self, user_id):
+        """Проверка лимита для сообщений"""
+        with self.lock:
+            return self._check_impl(user_id, self.requests)
+
+    def check_callback(self, user_id):
+        """Проверка лимита для callback-запросов (более щадящий)"""
+        with self.lock:
+            return self._check_impl(user_id, self.callback_requests, max_reqs=20)  # 20 запросов в минуту
+
+    def _check_impl(self, user_id, storage, max_reqs=None):
+        """Общая реализация проверки"""
+        current_time = time.time()
+        max_allowed = max_reqs or self.max_requests
+
+        if user_id not in storage:
+            storage[user_id] = []
+
+        # Очищаем старые запросы
+        storage[user_id] = [
+            req_time for req_time in storage[user_id]
+            if current_time - req_time < self.per_seconds
+        ]
+
+        # Проверяем лимит
+        if len(storage[user_id]) >= max_allowed:
+            return False
+
+        # Добавляем новый запрос
+        storage[user_id].append(current_time)
+        return True
+# ============================================================================
+# КЕШИРОВАНИЕ ДАННЫХ
+# ============================================================================
 class UserDataManager:
     """Менеджер данных пользователей с автоматической очисткой"""
 
@@ -284,146 +410,6 @@ class UserDataManager:
             data['session_questions'] = {}
         if topic in data['session_questions']:
             data['session_questions'][topic] = {}
-
-
-class ThreadSafeDict:
-    """Потокобезопасный словарь"""
-
-    def __init__(self):
-        self._data = {}
-        self._lock = Lock()
-
-    def __getitem__(self, key):
-        with self._lock:
-            return self._data.get(key)
-
-    def __setitem__(self, key, value):
-        with self._lock:
-            self._data[key] = value
-
-    def __delitem__(self, key):
-        with self._lock:
-            if key in self._data:
-                del self._data[key]
-
-    def get(self, key, default=None):
-        with self._lock:
-            return self._data.get(key, default)
-
-    def pop(self, key, default=None):
-        with self._lock:
-            return self._data.pop(key, default)
-
-    def clear(self):
-        with self._lock:
-            self._data.clear()
-
-
-# ============================================================================
-# КЕШИРОВАНИЕ ДАННЫХ
-# ============================================================================
-
-class CacheManager:
-    """Менеджер кеширования для ускорения работы"""
-
-    def __init__(self, ttl_seconds=300):
-        self.cache = {}
-        self.ttl = ttl_seconds
-
-    def get(self, key):
-        """Получение значения из кеша"""
-        if key in self.cache:
-            value, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return value
-            else:
-                del self.cache[key]  # Удаляем просроченный кеш
-        return None
-
-    def set(self, key, value):
-        """Установка значения в кеш"""
-        self.cache[key] = (value, time.time())
-
-    def delete(self, key):
-        """Удаление значения из кеша"""
-        self.cache.pop(key, None)
-
-    def clear(self):
-        """Очистка кеша"""
-        self.cache.clear()
-
-
-class RateLimiter:
-    """Простой rate limiter"""
-
-    def __init__(self, max_requests=10, per_seconds=60):
-        self.requests = {}
-        self.max_requests = max_requests
-        self.per_seconds = per_seconds
-        self.lock = Lock()
-
-    def check(self, user_id):
-        """Проверка лимита запросов"""
-        with self.lock:
-            current_time = time.time()
-
-            if user_id not in self.requests:
-                self.requests[user_id] = []
-
-            # Очищаем старые запросы
-            self.requests[user_id] = [
-                req_time for req_time in self.requests[user_id]
-                if current_time - req_time < self.per_seconds
-            ]
-
-            # Проверяем лимит
-            if len(self.requests[user_id]) >= self.max_requests:
-                return False
-
-            # Добавляем новый запрос
-            self.requests[user_id].append(current_time)
-            return True
-
-class RateLimiter:
-    def __init__(self, max_requests=10, per_seconds=60):
-        self.requests = {}
-        self.callback_requests = {}  # ОТДЕЛЬНО ДЛЯ CALLBACK
-        self.max_requests = max_requests
-        self.per_seconds = per_seconds
-        self.lock = Lock()
-
-    def check(self, user_id):
-        """Проверка лимита для сообщений"""
-        with self.lock:
-            return self._check_impl(user_id, self.requests)
-
-    def check_callback(self, user_id):
-        """Проверка лимита для callback-запросов (более щадящий)"""
-        with self.lock:
-            return self._check_impl(user_id, self.callback_requests, max_reqs=20)  # 20 запросов в минуту
-
-    def _check_impl(self, user_id, storage, max_reqs=None):
-        """Общая реализация проверки"""
-        current_time = time.time()
-        max_allowed = max_reqs or self.max_requests
-
-        if user_id not in storage:
-            storage[user_id] = []
-
-        # Очищаем старые запросы
-        storage[user_id] = [
-            req_time for req_time in storage[user_id]
-            if current_time - req_time < self.per_seconds
-        ]
-
-        # Проверяем лимит
-        if len(storage[user_id]) >= max_allowed:
-            return False
-
-        # Добавляем новый запрос
-        storage[user_id].append(current_time)
-        return True
-
 # ============================================================================
 # КЛАСС БАЗЫ ДАННЫХ
 # ============================================================================
@@ -655,6 +641,7 @@ class Database:
 
         try:
             cursor = conn.cursor()
+            updated = False  # Флаг, было ли обновление
 
             if end_datetime:
                 # УБЕЖДАЕМСЯ, ЧТО ДАТА В UTC
@@ -683,17 +670,18 @@ class Database:
                 WHERE telegram_id = ?
                 ''', (paid_status, start_str, end_str, is_trial, is_purchased, telegram_id))
 
+                updated = True
+
             if close_conn:
                 conn.commit()
                 conn.close()
 
-            # Инвалидация кеша
-            cache_key = f"subscription_{telegram_id}"
-            cache.delete(cache_key)
-            user_cache_key = f"user_{telegram_id}"
-            cache.delete(user_cache_key)
+            if updated:  # ✅ Логируем ТОЛЬКО если было обновление
+                # Инвалидация кеша - удаляем оба ключа по одному разу
+                cache.delete(f"user_{telegram_id}")
+                cache.delete(f"subscription_{telegram_id}")
+                logger.info(f"✅ Подписка пользователя {telegram_id} обновлена")
 
-            logger.info(f"✅ Подписка пользователя {telegram_id} обновлена")
             return True
 
         except sqlite3.Error as e:
@@ -1033,17 +1021,24 @@ class Database:
             SET subscription_paid = TRUE,
                 subscription_start_date = ?,
                 subscription_end_date = ?,
+                is_trial_used = FALSE,
+                subscription_purchased = TRUE,  -- ✅ ВАЖНО: помечаем как купленную
                 last_activity = CURRENT_TIMESTAMP
             WHERE telegram_id = ?
             ''', (start_str, end_str, telegram_id))
 
             conn.commit()
             conn.close()
+
+            # ✅ Очищаем кэш
+            cache.delete(f"user_{telegram_id}")
+            cache.delete(f"subscription_{telegram_id}")
+
             logger.info(f"✅ Пользователю {telegram_id} выдана подписка до {end_str}")
             return True
 
         except sqlite3.Error as e:
-            logger.info(f"❌ Ошибка при выдаче подписки: {e}")
+            logger.error(f"❌ Ошибка при выдаче подписки: {e}")
             return False
 
     def extend_subscription(self, telegram_id: int, hours: int = 0, days: int = 0) -> bool:
@@ -1104,6 +1099,9 @@ class Database:
 
             conn.commit()
             conn.close()
+
+            cache_key = f"user_{telegram_id}"
+            cache.delete(cache_key)
 
             logger.info(
                 f"✅ Подписка пользователя {telegram_id} продлена до {new_end_str} (+{days} дней, +{hours} часов)")
@@ -1302,7 +1300,43 @@ class Database:
             logger.info(f"❌ Ошибка при отметке платежа: {e}")
             return False
 
-# Глобальные переменные
+
+
+class ThreadSafeDict:
+    """Потокобезопасный словарь"""
+
+    def __init__(self):
+        self._data = {}
+        self._lock = Lock()
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._data.get(key)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            self._data[key] = value
+
+    def __delitem__(self, key):
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._data.get(key, default)
+
+    def pop(self, key, default=None):
+        with self._lock:
+            return self._data.pop(key, default)
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+# ============================================================================
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ============================================================================
 questions_by_topic = {}
 topics_list = []
 questions_loaded = False
@@ -1310,19 +1344,9 @@ scheduler = None
 user_data_manager = UserDataManager(ttl_minutes=120, cleanup_interval_minutes=10)
 # Создаем глобальный кеш-менеджер
 cache = CacheManager(ttl_seconds=300)  # 5 минут
-rate_limiter = RateLimiter(max_requests=30, per_seconds=60)  # 30 запросов в минуту
+rate_limiter = RateLimiter(max_requests=60, per_seconds=60)  # 30 запросов в минуту
+db = Database()
 
-
-
-def cache_questions():
-    """Кеширование вопросов для быстрого доступа"""
-    global all_questions_cache
-    all_questions_cache.clear()
-
-    for topic, questions in questions_by_topic.items():
-        all_questions_cache[topic] = questions.copy()
-
-    logger.info(f"✅ Вопросы закешированы: {len(all_questions_cache)} тем")
 # ============================================================================
 # ФУНКЦИИ ДЛЯ РАБОТЫ С ВОПРОСАМИ
 # ============================================================================
@@ -1379,7 +1403,7 @@ def check_database_health():
 
 
 def load_and_parse_questions(filename: str) -> bool:
-    """Оптимизированная загрузка вопросов"""
+    """Оптимизированная загрузка вопросов с выводом статистики по каждому вопросу"""
     global questions_by_topic, topics_list, questions_loaded
 
     try:
@@ -1399,8 +1423,13 @@ def load_and_parse_questions(filename: str) -> bool:
         current_topic = None
         current_question = None
         current_question_text = None
-        current_question_number = None  # НОВОЕ: для хранения номера вопроса
+        current_question_number = None
         current_answers = []
+
+        # Счетчики для статистики
+        total_questions_parsed = 0
+        questions_with_zero_correct = 0
+        questions_with_multiple_correct = 0
 
         lines = content.split('\n')
 
@@ -1413,11 +1442,28 @@ def load_and_parse_questions(filename: str) -> bool:
             if line.startswith('МДК'):
                 # Сохраняем предыдущий вопрос если есть
                 if current_topic and current_question and current_question_text:
+                    # Подсчитываем правильные ответы
+                    correct_count = sum(1 for a in current_answers if a.get('correct', False))
+
+                    # Выводим информацию о вопросе
+                    print(f"📊 Вопрос #{current_question_number}: {correct_count} правильных ответов")
+                    print(f"   Текст: {current_question_text[:50]}...")
+                    print(f"   Всего ответов: {len(current_answers)}")
+                    print("-" * 50)
+
+                    # Статистика
+                    total_questions_parsed += 1
+                    if correct_count == 0:
+                        questions_with_zero_correct += 1
+                    elif correct_count > 1:
+                        questions_with_multiple_correct += 1
+
                     temp_topics.setdefault(current_topic, []).append({
-                        'number': current_question_number,  # Номер вопроса
-                        'question': current_question_text,  # Текст вопроса
-                        'full_question': current_question,  # Полная строка с номером
-                        'answers': current_answers.copy()
+                        'number': current_question_number,
+                        'question': current_question_text,
+                        'full_question': current_question,
+                        'answers': current_answers.copy(),
+                        'correct_count': correct_count
                     })
 
                 current_topic = line
@@ -1425,26 +1471,51 @@ def load_and_parse_questions(filename: str) -> bool:
                 current_question_text = None
                 current_question_number = None
                 current_answers = []
+                print(f"\n📚 НАЧАЛО ТЕМЫ: {current_topic}")
+                print("=" * 70)
 
             # Проверяем, является ли строка номером вопроса
             elif re.match(r'^\d+\.', line):
                 # Сохраняем предыдущий вопрос если есть
                 if current_topic and current_question and current_question_text:
+                    # Подсчитываем правильные ответы
+                    correct_count = sum(1 for a in current_answers if a.get('correct', False))
+
+                    # Выводим информацию о вопросе
+                    print(f"📊 Вопрос #{current_question_number}: {correct_count} правильных ответов")
+                    print(f"   Текст: {current_question_text[:50]}...")
+                    print(f"   Всего ответов: {len(current_answers)}")
+
+                    # Если правильных ответов нет - это потенциальная проблема
+                    if correct_count == 0:
+                        print(f"   ⚠️ ВНИМАНИЕ: Нет правильных ответов!")
+                    elif correct_count > 1:
+                        print(f"   ℹ️ Несколько правильных ответов: {correct_count}")
+                    print("-" * 50)
+
+                    # Статистика
+                    total_questions_parsed += 1
+                    if correct_count == 0:
+                        questions_with_zero_correct += 1
+                    elif correct_count > 1:
+                        questions_with_multiple_correct += 1
+
                     temp_topics.setdefault(current_topic, []).append({
                         'number': current_question_number,
                         'question': current_question_text,
                         'full_question': current_question,
-                        'answers': current_answers.copy()
+                        'answers': current_answers.copy(),
+                        'correct_count': correct_count
                     })
 
                 # Извлекаем номер вопроса
                 match = re.match(r'^(\d+)\.', line)
                 if match:
-                    current_question_number = int(match.group(1))  # Номер вопроса как число
+                    current_question_number = int(match.group(1))
 
                 # Сохраняем полную строку вопроса
                 current_question = line
-                current_question_text = None  # Сброс текста вопроса
+                current_question_text = None
                 current_answers = []
 
             # Проверяем, является ли строка текстом вопроса (идет сразу после номера)
@@ -1454,20 +1525,42 @@ def load_and_parse_questions(filename: str) -> bool:
 
             # Проверяем, является ли строка вариантом ответа
             elif current_question and (line.startswith('+') or line.startswith('-')):
+                is_correct = line.startswith('+')
                 answer_text = line[1:].strip()
                 if answer_text:
                     current_answers.append({
                         'text': answer_text,
-                        'correct': line.startswith('+')
+                        'correct': is_correct
                     })
 
         # Сохраняем последний вопрос
         if current_topic and current_question and current_question_text:
+            # Подсчитываем правильные ответы
+            correct_count = sum(1 for a in current_answers if a.get('correct', False))
+
+            # Выводим информацию о последнем вопросе
+            print(f"\n📊 Вопрос #{current_question_number}: {correct_count} правильных ответов")
+            print(f"   Текст: {current_question_text[:50]}...")
+            print(f"   Всего ответов: {len(current_answers)}")
+
+            if correct_count == 0:
+                print(f"   ⚠️ ВНИМАНИЕ: Нет правильных ответов!")
+            elif correct_count > 1:
+                print(f"   ℹ️ Несколько правильных ответов: {correct_count}")
+            print("-" * 50)
+
+            total_questions_parsed += 1
+            if correct_count == 0:
+                questions_with_zero_correct += 1
+            elif correct_count > 1:
+                questions_with_multiple_correct += 1
+
             temp_topics.setdefault(current_topic, []).append({
                 'number': current_question_number,
                 'question': current_question_text,
                 'full_question': current_question,
-                'answers': current_answers
+                'answers': current_answers,
+                'correct_count': correct_count
             })
 
         # Копируем в глобальные переменные
@@ -1480,7 +1573,19 @@ def load_and_parse_questions(filename: str) -> bool:
 
         # Подсчитываем общее количество вопросов
         total_questions = sum(len(q) for q in questions_by_topic.values())
-        logger.info(f"✅ Загружено тем: {len(topics_list) - 1}, вопросов: {total_questions}")
+
+        # Выводим итоговую статистику
+        print("\n" + "=" * 70)
+        print("📊 ИТОГОВАЯ СТАТИСТИКА:")
+        print("=" * 70)
+        print(f"📚 Всего тем: {len(topics_list) - 1}")
+        print(f"❓ Всего вопросов: {total_questions}")
+        print(f"📝 Всего вопросов (по parsed): {total_questions_parsed}")
+        print(
+            f"✅ Вопросов с 1 правильным ответом: {total_questions_parsed - questions_with_zero_correct - questions_with_multiple_correct}")
+        print(f"⚠️ Вопросов без правильных ответов: {questions_with_zero_correct}")
+        print(f"ℹ️ Вопросов с несколькими правильными ответами: {questions_with_multiple_correct}")
+        print("=" * 70)
 
         # Выводим пример для проверки
         if topics_list and questions_by_topic:
@@ -1489,9 +1594,9 @@ def load_and_parse_questions(filename: str) -> bool:
                 example = questions_by_topic[first_topic][0]
                 logger.info(f"📝 Пример вопроса из '{first_topic}':")
                 logger.info(f"   Номер: {example.get('number', 'N/A')}")
-                logger.info(f"   Полная строка: {example.get('full_question', 'N/A')}")
                 logger.info(f"   Текст вопроса: {example['question'][:50]}...")
                 logger.info(f"   Ответов: {len(example['answers'])}")
+                logger.info(f"   Правильных ответов: {example.get('correct_count', 0)}")
 
         return True
 
@@ -1596,25 +1701,7 @@ def check_and_load_questions() -> bool:
 
 
 
-def send_message_async(chat_id, text, parse_mode=None, reply_markup=None):
-    """Асинхронная отправка сообщений без блокировки основного потока"""
-    import threading
 
-    def send():
-        try:
-            bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True  # Ускоряет отправку
-            )
-        except Exception as e:
-            logger.error(f"Ошибка асинхронной отправки: {e}")
-
-    thread = threading.Thread(target=send)
-    thread.daemon = True  # Поток завершится с основным
-    thread.start()
 
 def sync_paid_subscriptions_on_startup():
     """Синхронизация оплаченных подписок - ВСЕ В UTC"""
@@ -2021,8 +2108,87 @@ def create_yookassa_payment(telegram_id: int) -> Optional[Dict]:
         logger.info(f"❌ Ошибка при создании платежа: {e}")
         return None
 
+
+def ensure_subscription_status(user_id):
+    """Гарантированная проверка статуса подписки при каждом действии"""
+    logger.info(f"🔍 ПРОВЕРКА ПОДПИСКИ для пользователя {user_id}")
+    try:
+        cache_key = f"user_{user_id}"
+        cache.delete(cache_key)
+
+        user = db.get_user(user_id)
+        logger.info(f"   Данные пользователя: {user}")
+
+        if not user:
+            logger.info(f"   ❌ Пользователь не найден")
+            return False
+
+        if user.get('is_admin'):
+            logger.info(f"   ✅ Администратор, доступ разрешен")
+            return True
+
+        if not user.get('subscription_paid'):
+            logger.info(f"   ❌ subscription_paid = False")
+            return False
+
+        end_date_str = user.get('subscription_end_date')
+
+        if not end_date_str:
+            logger.info(f"   ❌ Нет даты окончания")
+            return False
+
+        try:
+            end_naive = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            try:
+                end_naive = datetime.strptime(end_date_str, '%Y-%m-%d')
+                end_naive = end_naive.replace(hour=23, minute=59, second=59)
+            except ValueError:
+                logger.info(f"   ❌ Неверный формат даты")
+                return False
+
+        end_aware = pytz.UTC.localize(end_naive)
+        now_aware = datetime.now(pytz.UTC)
+        logger.info(f"   Подписка активна: {end_aware > now_aware}")
+
+        if end_aware <= now_aware:
+            logger.info(f"   ⚠️ Подписка истекла, деактивирую...")
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users 
+                SET subscription_paid = FALSE,
+                    subscription_start_date = NULL,
+                    subscription_end_date = NULL
+                WHERE telegram_id = ?
+            ''', (user_id,))
+            conn.commit()
+            conn.close()
+            logger.info(f"   ✅ Подписка деактивирована")
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в ensure_subscription_status: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
 def check_user_access(chat_id: int, send_message: bool = True) -> bool:
-    """Проверка доступа пользователя"""
+    """Проверка доступа пользователя с автоматической деактивацией истекших подписок"""
+    logger.info(f"🔐 check_user_access для {chat_id}, send_message={send_message}")
+
+    cache.delete(f"user_{chat_id}")
+
+    user = db.get_user(chat_id)
+    logger.info(f"   Пользователь: {user.get('username') if user else 'None'}")
+    if user and user.get('is_admin'):
+        logger.info(f"   ✅ Админ, доступ разрешен")
+        return True
+
+    has_active = ensure_subscription_status(chat_id)
+    logger.info(f"   📊 Результат проверки подписки: {has_active}")
+
     if not questions_loaded:
         if send_message:
             markup = types.InlineKeyboardMarkup()
@@ -2034,7 +2200,7 @@ def check_user_access(chat_id: int, send_message: bool = True) -> bool:
             )
         return False
 
-    if not db.check_subscription(chat_id):
+    if not has_active:
         if send_message:
             user_info = db.get_user(chat_id)
             if user_info:
@@ -2062,7 +2228,7 @@ def check_user_access(chat_id: int, send_message: bool = True) -> bool:
                     reply_markup=markup
                 )
         return False
-
+    logger.info(f"   ✅ Доступ разрешен, обновляю активность")
     db.update_activity(chat_id)
     return True
 
@@ -2146,17 +2312,7 @@ def setup_bot_commands():
     except Exception as e:
         logger.info(f"❌ Ошибка настройки команд бота: {e}")
         return False
-def answer_callback_safe(bot_instance, call_id, text=None, show_alert=False):
-    """Безопасный ответ на callback query"""
-    try:
-        if text:
-            bot_instance.answer_callback_query(call_id, text=text, show_alert=show_alert)
-        else:
-            bot_instance.answer_callback_query(call_id)
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось ответить на callback {call_id}: {e}")
-        return False
+
 
 # ============================================================================
 # ОСНОВНЫЕ ОБРАБОТЧИКИ СООБЩЕНИЙ (ВКЛЮЧАЯ АДМИНИСТРАТИВНЫЕ)
@@ -2727,7 +2883,8 @@ def handle_grant_sub(message):
 def handle_check_my_payment(message):
     """Проверка последнего платежа пользователя"""
     chat_id = message.chat.id
-
+    if not check_user_access(chat_id):
+        return
     try:
         conn = db.get_connection()
         conn.row_factory = sqlite3.Row
@@ -3339,6 +3496,9 @@ def info_callback(call):
 • Увеличена стабильность системы.
 • Появилась более точная статистика.
 • Появилась возможность обнулять статистику.
+❓<b>Обновление от 18.03.2026 что нового?</b>
+• Обновлён банк вопросов под актальный файл.
+• Увеличение стабильности системы.
 📚 <b>Загружено:</b>
 • Тем: {len(topics_list) - 1 if topics_list else 0}
 • Вопросов: {sum(len(q) for q in questions_by_topic.values()) if questions_by_topic else 0}
@@ -4600,29 +4760,9 @@ def check_payment_callback(call):
         finally:
             answer_callback_safe(bot, call.id, "❌ Произошла ошибка")
 
-def validate_user_id(user_id):
-    """Валидация ID пользователя"""
-    try:
-        user_id_int = int(user_id)
-        if user_id_int <= 0:
-            raise ValueError("ID должен быть положительным числом")
-        if user_id_int > 2**63 - 1:  # Максимальный для Telegram
-            raise ValueError("ID слишком большой")
-        return user_id_int
-    except (ValueError, TypeError):
-        raise ValueError(f"Некорректный ID пользователя: {user_id}")
 
-def validate_days(days):
-    """Валидация количества дней"""
-    try:
-        days_int = int(days)
-        if days_int < 0:
-            raise ValueError("Количество дней не может быть отрицательным")
-        if days_int > 3650:  # 10 лет максимум
-            raise ValueError("Слишком большой срок")
-        return days_int
-    except (ValueError, TypeError):
-        raise ValueError(f"Некорректное количество дней: {days}")
+
+
 
 # ============================================================================
 # МАССОВАЯ РАССЫЛКА СООБЩЕНИЙ ВСЕМ ПОЛЬЗОВАТЕЛЯМ
@@ -4638,7 +4778,11 @@ def handle_extend_user_id(message):
     """Обработка ввода ID пользователя для продления"""
     chat_id = message.chat.id
     user_state = user_data_manager.extend_states[chat_id]
+    user = db.get_user(chat_id)
 
+    if not user or not user.get('is_admin'):
+        bot.send_message(chat_id, "❌ У вас нет прав для этой команды.")
+        return
     try:
         user_id = int(message.text.strip())
         user_state['user_id'] = user_id
@@ -4823,7 +4967,11 @@ def handle_send_all_users(call):
 def handle_broadcast_message(message):
     """Обработка сообщения для рассылки"""
     chat_id = message.chat.id
+    user = db.get_user(chat_id)
 
+    if not user or not user.get('is_admin'):
+        bot.send_message(chat_id, "❌ У вас нет прав для этой команды.")
+        return
     # Проверяем существование состояния
     if chat_id not in user_data_manager.broadcast_states:
         return
@@ -5458,11 +5606,6 @@ def restart_confirm_callback(call):
     except Exception as e:
         answer_callback_safe(bot, call.id, f"❌ Ошибка: {e}")
 
-
-
-
-
-
 def payment_instructions_callback(call):
     """Инструкция по оплате"""
     chat_id = call.message.chat.id
@@ -5580,87 +5723,6 @@ def handle_topic_selection(call):
         logger.error(f"❌ Неизвестная ошибка в handle_topic_selection: {e}")
         logger.error(traceback.format_exc())
         answer_callback_safe(bot, call.id, "❌ Ошибка выбора темы")
-
-
-def handle_topic_restart(call):
-    """ЕДИНСТВЕННЫЙ обработчик перезапуска темы"""
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-
-    try:
-        parts = call.data.split('_')
-        if len(parts) < 2:
-            answer_callback_safe(bot, call.id, "❌ Неверный формат")
-            return
-
-        topic_num = int(parts[1])
-
-        if 0 <= topic_num < len(topics_list):
-            selected_topic = topics_list[topic_num]
-            topic_display = selected_topic[:30] + "..." if len(selected_topic) > 30 else selected_topic
-
-            # Очищаем сессию
-            user_data_manager.clear_topic_session(chat_id, selected_topic)
-
-            # Сбрасываем статистику сессии
-            session_stats = user_data_manager.get_session_stats(chat_id)
-            session_stats['session_total'] = 0
-            session_stats['session_correct'] = 0
-
-            user_data_manager.update_user_data(
-                chat_id,
-                current_topic=selected_topic,
-                current_question=None,
-                correct_answer=None,
-                numbered_answers={},
-                answers_list=[],
-                current_question_topic=selected_topic
-            )
-
-            if selected_topic == "🎲 Все темы (рандом)":
-                topic_questions_count = sum(len(q) for q in questions_by_topic.values())
-            else:
-                topic_questions_count = len(questions_by_topic.get(selected_topic, []))
-
-            restart_text = f"""
-🔄 <b>Сессия для темы '{topic_display}' перезапущена!</b>
-
-📊 <b>Вопросов в теме:</b> {topic_questions_count}
-📈 <b>Прогресс:</b> 0/{topic_questions_count} (0.0%)
-
-👇 Выберите действие:
-            """
-
-            markup = types.InlineKeyboardMarkup()
-            markup.add(
-                types.InlineKeyboardButton("🎲 Начать обучение", callback_data="get_question"),
-                types.InlineKeyboardButton("📊 Статистика", callback_data="show_stats")
-            )
-            markup.add(
-                types.InlineKeyboardButton("↩️ Назад к выбору темы", callback_data="change_topic"),
-                types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")
-            )
-
-            try:
-                bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=restart_text,
-                    parse_mode='HTML',
-                    reply_markup=markup
-                )
-                answer_callback_safe(bot, call.id, f"Сессия для '{topic_display}' перезапущена")
-            except Exception as e:
-                logger.error(f"Ошибка при редактировании: {e}")
-                bot.send_message(chat_id, restart_text, parse_mode='HTML', reply_markup=markup)
-                answer_callback_safe(bot, call.id, f"Сессия для '{topic_display}' перезапущена")
-        else:
-            answer_callback_safe(bot, call.id, "❌ Неверный номер темы")
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка в handle_topic_restart: {e}")
-        answer_callback_safe(bot, call.id, "❌ Ошибка перезапуска")
-
 
 def handle_topic_restart(call):
     """Обработчик перезапуска темы из упрощенного формата (r_0, r_1)"""
@@ -5834,6 +5896,49 @@ def universal_callback_handler(call):
         except:
             pass
         return
+
+    # 🔥🔥🔥 КРИТИЧЕСКИ ВАЖНО: ПРОВЕРЯЕМ ПОДПИСКУ ПРИ ЛЮБОМ ДЕЙСТВИИ 🔥🔥🔥
+    # Пропускаем только callback'и, которые не требуют подписки
+    exempt_callbacks = [
+        "subscribe", "pay_now", "trial", "check_payment_",
+        "subscribe_info", "subscription_terms", "help_menu",
+        "info", "main_menu", "check_questions", "admin_"
+    ]
+
+    # Проверяем, нужно ли проверять подписку для этого callback
+    should_check_subscription = True
+    for exempt in exempt_callbacks:
+        if call.data.startswith(exempt):
+            should_check_subscription = False
+            break
+
+    if should_check_subscription:
+        # Проверяем подписку (send_message=False, чтобы не отправлять дублирующее сообщение)
+        if not check_user_access(user_id, send_message=False):
+            try:
+                # Отвечаем на callback с предупреждением
+                bot.answer_callback_query(
+                    call.id,
+                    "❌ Требуется активная подписка!",
+                    show_alert=True
+                )
+
+                # Отправляем сообщение о необходимости подписки
+                user = db.get_user(user_id)
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe"))
+                markup.add(types.InlineKeyboardButton("🎁 Получить пробный доступ", callback_data="trial"))
+                markup.row(types.InlineKeyboardButton("📞 Поддержка", url="https://t.me/ZlotaR"))
+
+                bot.send_message(
+                    user_id,
+                    "🚫 <b>Доступ ограничен!</b>\n\nДля использования бота необходима активная подписка.",
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось отправить сообщение о подписке: {e}")
+            return
     try:
         # Логируем полученный callback для отладки
         logger.info(
@@ -6021,12 +6126,18 @@ def setup_scheduler():
     try:
         scheduler = BackgroundScheduler()
 
-        # Ежедневная проверка подписок
+        # ПРОВЕРЯЕМ, ЧТО ПЛАНИРОВЩИК НЕ ЗАПУЩЕН
+        if scheduler and scheduler.running:
+            logger.info("⏰ Планировщик уже запущен, пропускаем...")
+            return scheduler
+
+        # Ежедневная проверка подписок - КАЖДЫЙ ЧАС для надежности
         scheduler.add_job(
             check_and_update_subscriptions,
-            trigger=CronTrigger(hour=0, minute=0, timezone=NOVOSIBIRSK_TZ),
-            id='daily_subscription_check',
-            name='Проверка подписок'
+            trigger=CronTrigger(minute=0),  # Каждый час в 0 минут
+            id='hourly_subscription_check',
+            name='Проверка подписок (каждый час)',
+            replace_existing=True
         )
 
         # Ежедневная синхронизация платежей (в 1:00 ночи)
@@ -6034,7 +6145,8 @@ def setup_scheduler():
             sync_paid_subscriptions_on_startup,
             trigger=CronTrigger(hour=1, minute=0, timezone=NOVOSIBIRSK_TZ),
             id='daily_payment_sync',
-            name='Синхронизация платежей'
+            name='Синхронизация платежей',
+            replace_existing=True
         )
 
         # Периодическая очистка памяти (каждые 30 минут)
@@ -6043,7 +6155,8 @@ def setup_scheduler():
             trigger='interval',
             minutes=30,
             id='memory_cleanup',
-            name='Очистка памяти'
+            name='Очистка памяти',
+            replace_existing=True
         )
 
         # Логирование использования памяти (каждый час)
@@ -6052,11 +6165,26 @@ def setup_scheduler():
             trigger='interval',
             hours=1,
             id='memory_log',
-            name='Логирование памяти'
+            name='Логирование памяти',
+            replace_existing=True
         )
 
-        scheduler.start()
-        logger.info("✅ Планировщик задач запущен")
+        # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА ПРИ ЗАПУСКЕ
+        scheduler.add_job(
+            check_and_update_subscriptions,
+            trigger='date',
+            run_date=datetime.now(pytz.UTC) + timedelta(seconds=10),
+            id='startup_subscription_check',
+            name='Проверка подписок при запуске',
+            replace_existing=True
+        )
+
+        # ЗАПУСКАЕМ ПЛАНИРОВЩИК
+        if not scheduler.running:
+            scheduler.start()
+            logger.info("✅ Планировщик задач ЗАПУЩЕН")
+        else:
+            logger.info("ℹ️ Планировщик уже работает")
 
         # Выводим информацию о запущенных задачах
         jobs = scheduler.get_jobs()
@@ -6069,8 +6197,11 @@ def setup_scheduler():
         return scheduler
 
     except Exception as e:
-        logger.info(f"❌ Ошибка при настройке планировщика: {e}")
+        logger.error(f"❌ Ошибка при настройке планировщика: {e}")
+        logger.error(traceback.format_exc())
         return None
+
+
 
 
 def log_memory_usage():
@@ -6273,7 +6404,7 @@ def setup_admin_from_env():
 # ============================================================================
 # ФУНКЦИЯ ДЛЯ ОДНОРАЗОВОГО ВЫПОЛНЕНИЯ ПРИ ЗАПУСКЕ
 # ============================================================================
-db = Database()
+
 def run_startup_tasks():
     """Задачи, выполняемые один раз при запуске бота"""
     check_database_health()
@@ -6379,9 +6510,16 @@ if __name__ == "__main__":
     logger.info("📂 Загрузка вопросов...")
     check_and_load_questions()
 
-    # Логирование запуска планировщика
-    logger.info("⏰ Настройка планировщика...")
-    setup_scheduler()
+    # ПРИНУДИТЕЛЬНО ЗАПУСКАЕМ ПЛАНИРОВЩИК
+    logger.info("⏰ Настройка и ЗАПУСК планировщика...")
+    scheduler = setup_scheduler()
+
+    if scheduler:
+        logger.info("✅ Планировщик успешно запущен")
+        # НЕМЕДЛЕННО ПРОВЕРЯЕМ ПОДПИСКИ
+        check_and_update_subscriptions()
+    else:
+        logger.error("❌ Не удалось запустить планировщик!")
 
     # Настраиваем обработчики сигналов
     signal.signal(signal.SIGINT, shutdown_handler)
@@ -6394,5 +6532,6 @@ if __name__ == "__main__":
     # Финальная очистка
     logger.info("🧹 Завершение работы...")
     user_data_manager.cleanup_old_data()
+    shutdown_handler()
 
     logger.info("👋 Бот завершил работу")
