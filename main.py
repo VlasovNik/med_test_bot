@@ -1403,7 +1403,7 @@ def check_database_health():
 
 
 def load_and_parse_questions(filename: str) -> bool:
-    """Оптимизированная загрузка вопросов с выводом статистики по каждому вопросу"""
+    """Оптимизированная загрузка вопросов"""
     global questions_by_topic, topics_list, questions_loaded
 
     try:
@@ -1423,13 +1423,8 @@ def load_and_parse_questions(filename: str) -> bool:
         current_topic = None
         current_question = None
         current_question_text = None
-        current_question_number = None
+        current_question_number = None  # НОВОЕ: для хранения номера вопроса
         current_answers = []
-
-        # Счетчики для статистики
-        total_questions_parsed = 0
-        questions_with_zero_correct = 0
-        questions_with_multiple_correct = 0
 
         lines = content.split('\n')
 
@@ -1442,28 +1437,11 @@ def load_and_parse_questions(filename: str) -> bool:
             if line.startswith('МДК'):
                 # Сохраняем предыдущий вопрос если есть
                 if current_topic and current_question and current_question_text:
-                    # Подсчитываем правильные ответы
-                    correct_count = sum(1 for a in current_answers if a.get('correct', False))
-
-                    # Выводим информацию о вопросе
-                    print(f"📊 Вопрос #{current_question_number}: {correct_count} правильных ответов")
-                    print(f"   Текст: {current_question_text[:50]}...")
-                    print(f"   Всего ответов: {len(current_answers)}")
-                    print("-" * 50)
-
-                    # Статистика
-                    total_questions_parsed += 1
-                    if correct_count == 0:
-                        questions_with_zero_correct += 1
-                    elif correct_count > 1:
-                        questions_with_multiple_correct += 1
-
                     temp_topics.setdefault(current_topic, []).append({
-                        'number': current_question_number,
-                        'question': current_question_text,
-                        'full_question': current_question,
-                        'answers': current_answers.copy(),
-                        'correct_count': correct_count
+                        'number': current_question_number,  # Номер вопроса
+                        'question': current_question_text,  # Текст вопроса
+                        'full_question': current_question,  # Полная строка с номером
+                        'answers': current_answers.copy()
                     })
 
                 current_topic = line
@@ -1471,51 +1449,26 @@ def load_and_parse_questions(filename: str) -> bool:
                 current_question_text = None
                 current_question_number = None
                 current_answers = []
-                print(f"\n📚 НАЧАЛО ТЕМЫ: {current_topic}")
-                print("=" * 70)
 
             # Проверяем, является ли строка номером вопроса
             elif re.match(r'^\d+\.', line):
                 # Сохраняем предыдущий вопрос если есть
                 if current_topic and current_question and current_question_text:
-                    # Подсчитываем правильные ответы
-                    correct_count = sum(1 for a in current_answers if a.get('correct', False))
-
-                    # Выводим информацию о вопросе
-                    print(f"📊 Вопрос #{current_question_number}: {correct_count} правильных ответов")
-                    print(f"   Текст: {current_question_text[:50]}...")
-                    print(f"   Всего ответов: {len(current_answers)}")
-
-                    # Если правильных ответов нет - это потенциальная проблема
-                    if correct_count == 0:
-                        print(f"   ⚠️ ВНИМАНИЕ: Нет правильных ответов!")
-                    elif correct_count > 1:
-                        print(f"   ℹ️ Несколько правильных ответов: {correct_count}")
-                    print("-" * 50)
-
-                    # Статистика
-                    total_questions_parsed += 1
-                    if correct_count == 0:
-                        questions_with_zero_correct += 1
-                    elif correct_count > 1:
-                        questions_with_multiple_correct += 1
-
                     temp_topics.setdefault(current_topic, []).append({
                         'number': current_question_number,
                         'question': current_question_text,
                         'full_question': current_question,
-                        'answers': current_answers.copy(),
-                        'correct_count': correct_count
+                        'answers': current_answers.copy()
                     })
 
                 # Извлекаем номер вопроса
                 match = re.match(r'^(\d+)\.', line)
                 if match:
-                    current_question_number = int(match.group(1))
+                    current_question_number = int(match.group(1))  # Номер вопроса как число
 
                 # Сохраняем полную строку вопроса
                 current_question = line
-                current_question_text = None
+                current_question_text = None  # Сброс текста вопроса
                 current_answers = []
 
             # Проверяем, является ли строка текстом вопроса (идет сразу после номера)
@@ -1525,42 +1478,20 @@ def load_and_parse_questions(filename: str) -> bool:
 
             # Проверяем, является ли строка вариантом ответа
             elif current_question and (line.startswith('+') or line.startswith('-')):
-                is_correct = line.startswith('+')
                 answer_text = line[1:].strip()
                 if answer_text:
                     current_answers.append({
                         'text': answer_text,
-                        'correct': is_correct
+                        'correct': line.startswith('+')
                     })
 
         # Сохраняем последний вопрос
         if current_topic and current_question and current_question_text:
-            # Подсчитываем правильные ответы
-            correct_count = sum(1 for a in current_answers if a.get('correct', False))
-
-            # Выводим информацию о последнем вопросе
-            print(f"\n📊 Вопрос #{current_question_number}: {correct_count} правильных ответов")
-            print(f"   Текст: {current_question_text[:50]}...")
-            print(f"   Всего ответов: {len(current_answers)}")
-
-            if correct_count == 0:
-                print(f"   ⚠️ ВНИМАНИЕ: Нет правильных ответов!")
-            elif correct_count > 1:
-                print(f"   ℹ️ Несколько правильных ответов: {correct_count}")
-            print("-" * 50)
-
-            total_questions_parsed += 1
-            if correct_count == 0:
-                questions_with_zero_correct += 1
-            elif correct_count > 1:
-                questions_with_multiple_correct += 1
-
             temp_topics.setdefault(current_topic, []).append({
                 'number': current_question_number,
                 'question': current_question_text,
                 'full_question': current_question,
-                'answers': current_answers,
-                'correct_count': correct_count
+                'answers': current_answers
             })
 
         # Копируем в глобальные переменные
@@ -1573,19 +1504,7 @@ def load_and_parse_questions(filename: str) -> bool:
 
         # Подсчитываем общее количество вопросов
         total_questions = sum(len(q) for q in questions_by_topic.values())
-
-        # Выводим итоговую статистику
-        print("\n" + "=" * 70)
-        print("📊 ИТОГОВАЯ СТАТИСТИКА:")
-        print("=" * 70)
-        print(f"📚 Всего тем: {len(topics_list) - 1}")
-        print(f"❓ Всего вопросов: {total_questions}")
-        print(f"📝 Всего вопросов (по parsed): {total_questions_parsed}")
-        print(
-            f"✅ Вопросов с 1 правильным ответом: {total_questions_parsed - questions_with_zero_correct - questions_with_multiple_correct}")
-        print(f"⚠️ Вопросов без правильных ответов: {questions_with_zero_correct}")
-        print(f"ℹ️ Вопросов с несколькими правильными ответами: {questions_with_multiple_correct}")
-        print("=" * 70)
+        logger.info(f"✅ Загружено тем: {len(topics_list) - 1}, вопросов: {total_questions}")
 
         # Выводим пример для проверки
         if topics_list and questions_by_topic:
@@ -1594,9 +1513,9 @@ def load_and_parse_questions(filename: str) -> bool:
                 example = questions_by_topic[first_topic][0]
                 logger.info(f"📝 Пример вопроса из '{first_topic}':")
                 logger.info(f"   Номер: {example.get('number', 'N/A')}")
+                logger.info(f"   Полная строка: {example.get('full_question', 'N/A')}")
                 logger.info(f"   Текст вопроса: {example['question'][:50]}...")
                 logger.info(f"   Ответов: {len(example['answers'])}")
-                logger.info(f"   Правильных ответов: {example.get('correct_count', 0)}")
 
         return True
 
